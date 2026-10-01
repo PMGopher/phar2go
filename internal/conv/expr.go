@@ -816,6 +816,12 @@ func (f *fctx) fieldOf(obj value, name string, n ast.Vertex) value {
 
 // staticClass resolves the class of a static access (self, static, parent or a name).
 func (f *fctx) staticClass(n ast.Vertex) (local *class, phpName string, kind string) {
+	switch n.(type) {
+	case *ast.Name, *ast.NameFullyQualified, *ast.NameRelative, *ast.Identifier:
+	default:
+		// $class::..., $this->x::...
+		return nil, "", "dynamic"
+	}
 	name := identValue(n)
 	switch strings.ToLower(name) {
 	case "self", "static":
@@ -879,6 +885,10 @@ func (f *fctx) classConst(x *ast.ExprClassConstFetch) value {
 			return value{code: cd.GoName, t: cd.Type, prec: 7, konst: cd.isConst && cd.Type != nil && cd.Type.IsNumber()}
 		}
 		return callv(f.todo(x, "constant %s::%s not found", c.FQCN, name)+f.phpx("Unsupported")+"("+quote("constant "+name)+")", api.Any)
+	}
+	if kind == "dynamic" {
+		cls := f.expr(x.Class, nil)
+		return callv(f.phpx("CallStatic")+"("+cls.code+", "+quote("const:"+name)+")", api.Any)
 	}
 	if v, ok := f.extConst(php, name); ok {
 		return v

@@ -670,3 +670,51 @@ func GetParentClass(v any) any {
 	}
 	return false
 }
+
+var (
+	staticMethods = map[string]map[string]any{}
+	constructors  = map[string]any{}
+)
+
+// RegisterStatic records a static method of a plugin class, for $class::method().
+func RegisterStatic(class, method string, fn any) {
+	class = strings.ToLower(class)
+	if staticMethods[class] == nil {
+		staticMethods[class] = map[string]any{}
+	}
+	staticMethods[class][strings.ToLower(method)] = fn
+}
+
+// RegisterNew records the constructor (New function) of a plugin class, for new $class().
+func RegisterNew(class string, fn any) {
+	constructors[strings.ToLower(class)] = fn
+}
+
+func classOf(v any) string {
+	if s, ok := v.(string); ok {
+		return strings.ToLower(strings.TrimPrefix(s, "\\"))
+	}
+	return strings.ToLower(ClassName(v))
+}
+
+// CallStatic is $class::method(...$args) with a class name (or object) known at run time.
+func CallStatic(class any, method string, args ...any) any {
+	c := classOf(class)
+	for _, k := range append([]string{c}, classParents[c]...) {
+		if fn, ok := staticMethods[k][strings.ToLower(method)]; ok {
+			return Invoke(fn, args...)
+		}
+	}
+	Throw(NewError("Error", "Call to undefined method "+c+"::"+method+"()"))
+	return nil
+}
+
+// New is new $class(...$args) with a class name known at run time.
+func New(class any, args ...any) any {
+	c := classOf(class)
+	if fn, ok := constructors[c]; ok {
+		return Invoke(fn, args...)
+	}
+	Throw(NewError("Error", "Class \""+c+"\" not found"))
+	return nil
+}

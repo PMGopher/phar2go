@@ -141,8 +141,32 @@ func (cv *converter) emitAll(res *Result) {
 				parents = append(parents, quote(c.FQCN)+": {"+strings.Join(ps, ", ")+"},")
 			}
 		}
+		// Static methods, constructors and constants, for $class::method(), new $class() and
+		// $class::CONST.
+		var statics []string
+		for _, c := range cv.classList {
+			if c.Kind == kindTrait || c.Kind == kindInterface || strings.HasPrefix(c.File.Path, "phar2go-stubs/") {
+				continue
+			}
+			for _, m := range c.Methods {
+				if m.Static && m.HasBody {
+					statics = append(statics, fmt.Sprintf("%s(%s, %s, %s)", f.phpx("RegisterStatic"), quote(c.FQCN), quote(m.Name), m.GoName))
+				}
+			}
+			for _, k := range c.Consts {
+				if k.Class == c {
+					statics = append(statics, fmt.Sprintf("%s(%s, %s, func() any { return %s })", f.phpx("RegisterStatic"), quote(c.FQCN), quote("const:"+k.Name), k.GoName))
+				}
+			}
+			if c.Kind == kindClass && !c.Abstract {
+				statics = append(statics, fmt.Sprintf("%s(%s, New%s)", f.phpx("RegisterNew"), quote(c.FQCN), c.GoName))
+			}
+		}
 		reg := fmt.Sprintf("// The plugin's classes, for class_exists(), is_a() and is_subclass_of().\nfunc init() {\n%s([]string{\n%s,\n}, []string{%s})\n%s(map[string][]string{\n%s\n})\n}",
 			f.phpx("RegisterClasses"), strings.Join(classes, ",\n"), strings.Join(funcs, ", "), f.phpx("RegisterParents"), strings.Join(parents, "\n"))
+		if len(statics) > 0 {
+			reg += "\n\n// Static methods, constructors and constants, for $class::method() and new $class().\nfunc init() {\n" + strings.Join(statics, "\n") + "\n}"
+		}
 		if cv.usesServer {
 			srv := f.pkgRef(cv.idx.Module+"/pocketmine/server") + ".Server"
 			pl := "*" + cv.mainType
@@ -751,7 +775,7 @@ func (cv *converter) emitBody(gf *goFile, f *fctx, m *method, header, doc string
 	}
 	body := f.block(m.Body)
 	decls := f.declareLocals(body)
-	if len(sig.Results) > 0 && !terminates(body) {
+	if len(sig.Results) > 0 && !terminates(body) && !endsWithReturn(m.Body) {
 		body += "\n" + f.returnStmt(nil)
 	}
 	all := append(prologue, decls...)
@@ -908,4 +932,14 @@ func (cv *converter) extAncestors(t *api.Type) []string {
 	}
 	walkT(t)
 	return out
+}
+
+// endsWithReturn reports whether PHP statements end with a return statement (a Go terminating
+// statement once converted).
+func endsWithReturn(stmts []ast.Vertex) bool {
+	if len(stmts) == 0 {
+		return false
+	}
+	_, ok := stmts[len(stmts)-1].(*ast.StmtReturn)
+	return ok
 }

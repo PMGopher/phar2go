@@ -490,7 +490,7 @@ func (f *fctx) staticCall(x *ast.ExprStaticCall) value {
 	switch {
 	case kind == "dynamic":
 		cls := f.expr(x.Class, nil)
-		return callv(f.phpx("Call")+"("+cls.code+", "+quote(name)+f.anyArgs(x.Args)+")", api.Any)
+		return callv(f.phpx("CallStatic")+"("+cls.code+", "+quote(name)+f.anyArgs(x.Args)+")", api.Any)
 	case kind == "parent" && c == nil:
 		return f.parentExtCall(php, name, x.Args, x)
 	case c != nil:
@@ -725,8 +725,8 @@ func (f *fctx) newExpr(x *ast.ExprNew) value {
 	}
 	name := identValue(x.Class)
 	if name == "" {
-		f.expr(x.Class, nil)
-		return callv(f.todo(x, "new with a dynamic class name")+f.phpx("Unsupported")+`("new $class")`, api.Any)
+		cls := f.expr(x.Class, nil)
+		return callv(f.phpx("New")+"("+cls.code+f.anyArgs(x.Args)+")", api.Any)
 	}
 	full := f.cv.resolveName(f.file, x.Class)
 	switch strings.ToLower(name) {

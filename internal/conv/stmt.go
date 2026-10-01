@@ -859,7 +859,7 @@ func (f *fctx) closure(params []ast.Vertex, uses []ast.Vertex, retNode ast.Verte
 	} else {
 		g.inferLocals(stmts)
 		body = g.block(stmts)
-		if len(sig.Results) > 0 && !terminates(body) {
+		if len(sig.Results) > 0 && !terminates(body) && !(endsWithReturn(stmts) && g.tryDepth == 0) {
 			body += "\n" + g.returnStmt(nil)
 		}
 	}
