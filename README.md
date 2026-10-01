@@ -96,12 +96,18 @@ A converted plugin is its own Go module (see its `go.mod`): add it to the server
   conversion, `try`/`catch`/`finally`, `match`, `static` variables, by-reference parameters
 - Around 350 PHP functions (strings, arrays, math, JSON, YAML, regular expressions with PCRE
   lookarounds, files, dates)
-- Virions bundled in the phar are converted with the plugin
+- Custom entities (mobs with AI), items, enchantments and registries (`RegistryTrait`,
+  `EnumTrait`, native enums), generators (`yield`), first-class callables
+- Databases: PHP's `SQLite3` and `mysqli` classes, libasynql and libSQL run on Go's
+  `database/sql` (SQLite and MySQL drivers are added to the converted plugin)
+- Virions bundled in the phar are converted with the plugin; virions that need PHP threads or
+  PocketMine-MP internals (libasynql, libSQL, SimplePacketHandler, bStats) are replaced
 
 Code that has no equivalent is marked `TODO(phar2go)` and listed in `CONVERSION.md`. It still
 compiles, and throws an error only if it runs. Typical cases: PocketMine-MP internals that
-PocketMine-go doesn't have (raw network packets, NBT tags), PHP extensions (SQLite3, mysqli,
-threads), generators (`yield`), `eval` and reflection.
+PocketMine-go doesn't have (raw network packets), `eval`, and plugins written for an older
+PocketMine-MP API (API 4). When such an error happens, the server log names the Go file and
+line of the converted code.
 
 ## Building from source
 

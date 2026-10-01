@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -241,7 +243,7 @@ func Try(body func() (int, any), finally func(), catches ...Catch) (ctl int, val
 // OnRun, ...). Use it as `defer phpx.Recover(&err)`.
 func Recover(err *error) {
 	if r := recover(); r != nil {
-		t := AsThrowable(r)
+		t := AsThrowable(withLocation(r))
 		*err = t
 	}
 }
@@ -249,7 +251,7 @@ func Recover(err *error) {
 // RecoverLog recovers a panic and reports it through log (for methods without an error result).
 func RecoverLog(log func(string)) {
 	if r := recover(); r != nil {
-		t := AsThrowable(r)
+		t := AsThrowable(withLocation(r))
 		log(t.ToString())
 	}
 }
@@ -280,7 +282,7 @@ var LogWarning = func(msg string) { fmt.Fprintln(os.Stderr, msg) }
 // in the plugin doesn't stop the server. Use it as `defer phpx.RecoverAndLog("...")`.
 func RecoverAndLog(where string) {
 	if r := recover(); r != nil {
-		t := AsThrowable(r)
+		t := AsThrowable(withLocation(r))
 		LogError(fmt.Sprintf("%s: %s", where, t.ToString()))
 	}
 }
@@ -292,5 +294,26 @@ var skipped sync.Map
 func Skipped(what string, _ ...any) {
 	if _, seen := skipped.LoadOrStore(what, true); !seen {
 		LogWarning("phar2go: skipped code that couldn't be converted: " + what)
+	}
+}
+
+// withLocation adds where a Go runtime error (nil pointer, index out of range) happened in the
+// converted code to it, as PHP errors have a file and line.
+func withLocation(r any) any {
+	re, ok := r.(runtime.Error)
+	if !ok {
+		return r
+	}
+	pcs := make([]uintptr, 64)
+	n := runtime.Callers(3, pcs)
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		fr, more := frames.Next()
+		if !strings.HasPrefix(fr.Function, "runtime.") && !strings.Contains(fr.Function, "/internal/phpx.") && fr.File != "" {
+			return fmt.Errorf("%s (at %s:%d)", re.Error(), filepath.Base(fr.File), fr.Line)
+		}
+		if !more {
+			return r
+		}
 	}
 }

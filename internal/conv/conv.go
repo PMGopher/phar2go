@@ -144,6 +144,12 @@ func Convert(idx *api.Index, files map[string][]byte, opts Options) (*Result, er
 	res.Warnings = cv.warnings
 	res.UsesServer = cv.usesServer
 	res.UsesSQL = usesSQL
+	for _, f := range cv.files {
+		// phar2go's SQLite3 and mysqli classes.
+		if f.Path == "phar2go-stubs/SQLite3.php" || f.Path == "phar2go-stubs/mysqli.php" {
+			res.UsesSQL = true
+		}
+	}
 	res.TODOs = cv.todos
 	for _, c := range cv.classList {
 		if c.Kind != kindTrait {
@@ -180,6 +186,8 @@ var virionReplacements = []struct {
 	{`muqsit\simplepackethandler`, "SimplePacketHandler.php", "simplepackethandler"},
 	// bStats sends plugin statistics from a PHP thread.
 	{`bStats\PocketmineMp`, "Metrics.php", "bstats"},
+	// libSQL runs queries on PHP threads with the sqlite3/mysqli extensions.
+	{`cooldogedev\libSQL`, "ConnectionPool.php", "libsql"},
 }
 
 // replaceVirions swaps bundled libraries for phar2go's versions (see virionReplacements). It
@@ -231,7 +239,7 @@ func replaceVirions(files map[string][]byte) (map[string][]byte, bool) {
 			return nil
 		})
 		files = out
-		if v.dir == "libasynql" {
+		if v.dir == "libasynql" || v.dir == "libsql" {
 			usesSQL = true
 		}
 	}

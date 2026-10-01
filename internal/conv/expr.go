@@ -1298,6 +1298,15 @@ func (f *fctx) coalesce(ln, rn ast.Vertex, want *api.Type) value {
 	l := f.expr(ln, want)
 	r := f.expr(rn, want)
 	if l.t != nil && !l.t.Nilable() && !isAny(l.t) && !isArrayT(l.t) && !isNilV(l) {
+		// $this->prop ?? $default where prop is a typed property without a default: null (not
+		// initialized) in PHP until it is set, Go's zero value here.
+		if pf, ok := ln.(*ast.ExprPropertyFetch); ok && varName(pf.Var) == "this" && f.cls != nil && !f.static && (l.t.IsString() || l.t.IsNumber() || l.t.IsBool()) {
+			if p := f.cls.findProp(identValue(pf.Prop)); p != nil && !p.Static && p.Default == nil && p.TypeNode != nil && !p.Promoted {
+				t := l.t
+				tmp := f.newTmp("v")
+				return callv(fmt.Sprintf("func() %s { if %s := %s; %s != %s { return %s }; return %s }()", f.typeStr(t), tmp, l.code, tmp, f.zero(t), tmp, f.coerce(r, t)), t)
+			}
+		}
 		// Never null.
 		return l
 	}

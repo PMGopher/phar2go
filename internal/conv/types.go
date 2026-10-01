@@ -199,6 +199,12 @@ func (cv *converter) classRef(fqcn string, ctx *class) *api.Type {
 		return throwableT
 	case "jsonserializable":
 		return &api.Type{K: api.KNamed, Name: "phpx.JsonSerializable", Iface: true}
+	case `pocketmine\plugin\pluginbase`:
+		// A PluginBase value is a plugin's main object: the plugin.Plugin interface keeps it
+		// (a *plugin.PluginBase would be only the base embedded in it).
+		if t := cv.extClassType(`pocketmine\plugin\Plugin`); t != nil {
+			return t
+		}
 	}
 	if c := cv.classes[key]; c != nil {
 		return cv.classType(c)
