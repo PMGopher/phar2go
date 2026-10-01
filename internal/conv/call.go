@@ -647,6 +647,10 @@ func (f *fctx) extStaticCall(php, name string, args []ast.Vertex, n ast.Vertex) 
 	}
 	pkg := f.cv.extPackage(php)
 	short := lastSeg(php)
+	if pkg == nil && isClientOnly(php) {
+		f.warn(n, "%s::%s() has no pocketmine-go equivalent; it is replaced by an object that does nothing", php, name)
+		return callv(f.phpx("Stub")+"("+quote(php+"::"+name)+f.anyArgs(args)+")", api.Any)
+	}
 	if pkg == nil {
 		if isThrowableClass(php) {
 			return callv(f.todo(n, "static call %s::%s()", php, name)+f.phpx("Unsupported")+"("+quote(name)+f.anyArgs(args)+")", api.Any)
@@ -799,6 +803,10 @@ func (f *fctx) newExt(php string, args []ast.Vertex, n ast.Vertex) value {
 	t := f.cv.extClassType(php)
 	pkg := f.cv.extPackage(php)
 	if pkg == nil {
+		if isClientOnly(php) {
+			f.warn(n, "%s has no pocketmine-go equivalent; it is replaced by an object that does nothing", php)
+			return callv(f.phpx("Stub")+"("+quote("new "+php)+f.anyArgs(args)+")", api.Any)
+		}
 		f.cv.external[php] = true
 		return callv(f.todo(n, "class %s doesn't exist in pocketmine-go", php)+f.phpx("Unsupported")+"("+quote("new "+php)+f.anyArgs(args)+")", api.Any)
 	}
@@ -860,4 +868,11 @@ func (cv *converter) localImplementor(t *api.Type, name string) *class {
 		return found[0]
 	}
 	return nil
+}
+
+// isClientOnly reports whether a PocketMine-MP class only affects what clients see (network
+// packets and their types): code using it keeps running without it.
+func isClientOnly(php string) bool {
+	l := strings.ToLower(strings.TrimPrefix(php, "\\"))
+	return strings.HasPrefix(l, `pocketmine\network\mcpe\protocol\`)
 }

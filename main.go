@@ -157,6 +157,17 @@ func install(server string, rep *project.Report) error {
 	if err := goCmd(server, "mod", "edit", "-require="+rep.Module+"@v0.0.0", "-replace="+rep.Module+"="+rel); err != nil {
 		return err
 	}
+	if rep.UsesSQL {
+		// The plugin's database drivers (it bundles libasynql).
+		args := []string{"get"}
+		for _, d := range project.SQLDrivers {
+			args = append(args, strings.Replace(d, " ", "@", 1))
+		}
+		fmt.Println("  Downloading the database drivers...")
+		if err := goCmd(server, args...); err != nil {
+			return err
+		}
+	}
 	pluginsGo := filepath.Join(server, "cmd", "pocketmine-go", "plugins.go")
 	src, err := os.ReadFile(pluginsGo)
 	if err != nil {
@@ -197,6 +208,9 @@ func checkBuild(pm string, rep *project.Report) error {
 	work := fmt.Sprintf("go 1.26.1\n\nuse (\n\t.\n\t%s\n)\n", filepath.ToSlash(abs))
 	if err := os.WriteFile(filepath.Join(rep.Out, "go.work"), []byte(work), 0o644); err != nil {
 		return err
+	}
+	if rep.UsesSQL {
+		goCmd(rep.Out, "mod", "tidy")
 	}
 	fmt.Println("  Building against", abs, "...")
 	if err := goCmd(rep.Out, "build", "./..."); err != nil {

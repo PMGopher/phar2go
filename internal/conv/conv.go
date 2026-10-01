@@ -4,6 +4,8 @@ package conv
 import (
 	"embed"
 	"fmt"
+	"io/fs"
+	"regexp"
 	"path"
 	"sort"
 	"strings"
@@ -43,6 +45,9 @@ type Result struct {
 	MainType string
 	// UsesServer is set when the code needs the plugin instance for Server::getInstance().
 	UsesServer bool
+	// UsesSQL is set when the plugin bundles libasynql: the converted plugin then needs the
+	// database/sql drivers.
+	UsesSQL bool
 }
 
 type converter struct {
@@ -93,6 +98,7 @@ func Convert(idx *api.Index, files map[string][]byte, opts Options) (*Result, er
 		uses: map[*phpFile]map[string]string{}, localMethods: map[string]map[string]*api.Func{},
 		pkgNames: map[string]bool{}, defines: map[string]string{}, extKnown: map[string]bool{},
 	}
+	files, usesSQL := replaceVirions(files)
 	var paths []string
 	for p := range files {
 		paths = append(paths, p)
@@ -137,6 +143,7 @@ func Convert(idx *api.Index, files map[string][]byte, opts Options) (*Result, er
 	cv.emitAll(res)
 	res.Warnings = cv.warnings
 	res.UsesServer = cv.usesServer
+	res.UsesSQL = usesSQL
 	res.TODOs = cv.todos
 	for _, c := range cv.classList {
 		if c.Kind != kindTrait {
@@ -154,6 +161,65 @@ func Convert(idx *api.Index, files map[string][]byte, opts Options) (*Result, er
 
 //go:embed stubs/*.php
 var stubs embed.FS
+
+//go:embed virions
+var virionStubs embed.FS
+
+// virionReplacements are libraries (virions) that can't work on pocketmine-go as they are:
+// the anchor class identifies the library (whatever namespace it was shaded to) and its files
+// are replaced by phar2go's version in virions/<dir>.
+var virionReplacements = []struct {
+	namespace string // the library's namespace, without the shading prefix
+	anchor    string // the file of its main class
+	dir       string
+}{
+	// libasynql needs PHP threads and the sqlite3/mysqli extensions; the replacement runs the
+	// queries on Go's database/sql.
+	{`poggit\libasynql`, "libasynql.php", "libasynql"},
+	// SimplePacketHandler works on PocketMine-MP's packet classes.
+	{`muqsit\simplepackethandler`, "SimplePacketHandler.php", "simplepackethandler"},
+}
+
+// replaceVirions swaps bundled libraries for phar2go's versions (see virionReplacements). It
+// reports whether libasynql was replaced (the plugin then needs database drivers).
+func replaceVirions(files map[string][]byte) (map[string][]byte, bool) {
+	usesSQL := false
+	reNS := regexp.MustCompile(`(?m)^\s*namespace\s+([^;\s]+)\s*;`)
+	for _, v := range virionReplacements {
+		var dir, ns string
+		for p, src := range files {
+			if strings.HasSuffix(p, "/"+v.anchor) {
+				if m := reNS.FindSubmatch(src); m != nil && strings.HasSuffix(strings.ToLower(string(m[1])), strings.ToLower(v.namespace)) {
+					dir, ns = p[:strings.LastIndexByte(p, '/')+1], string(m[1])
+					break
+				}
+			}
+		}
+		if dir == "" {
+			continue
+		}
+		out := make(map[string][]byte, len(files))
+		for p, src := range files {
+			if !strings.HasPrefix(p, dir) {
+				out[p] = src
+			}
+		}
+		root := "virions/" + v.dir
+		fs.WalkDir(virionStubs, root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return err
+			}
+			data, _ := virionStubs.ReadFile(p)
+			out[dir+strings.TrimPrefix(p, root+"/")] = []byte(strings.ReplaceAll(string(data), "__NS__", ns))
+			return nil
+		})
+		files = out
+		if v.dir == "libasynql" {
+			usesSQL = true
+		}
+	}
+	return files, usesSQL
+}
 
 // addStubs adds PHP versions of PocketMine-MP traits that pocketmine-go has no Go type for,
 // when the plugin uses them.
@@ -519,6 +585,9 @@ func (cv *converter) methodSig(c *class, m *method) {
 		}
 	}
 	ret := cv.phpType(f, m.ReturnNode, docType(m.Doc, "return", ""), c)
+	if m.HasBody && containsYield(m.Body) {
+		ret = generatorT
+	}
 	if ret == nil {
 		if m.HasBody && returnsValue(m.Body) {
 			ret = api.Any
@@ -1018,4 +1087,20 @@ func hiddenTypes(sig *api.Func) bool {
 		}
 	}
 	return false
+}
+
+// containsYield reports whether a function body is a generator (yields, outside nested
+// functions).
+func containsYield(body []ast.Vertex) bool {
+	found := false
+	walkAll(body, func(n ast.Vertex) bool {
+		switch n.(type) {
+		case *ast.ExprClosure, *ast.ExprArrowFunction, *ast.StmtClass, *ast.StmtFunction:
+			return false
+		case *ast.ExprYield, *ast.ExprYieldFrom:
+			found = true
+		}
+		return !found
+	})
+	return found
 }

@@ -16,4 +16,15 @@ final class Counter{
 	public function get() : int{
 		return $this->value;
 	}
+
+	/**
+	 * @return \Generator<int, int, int, string>
+	 */
+	public function steps(int $n) : \Generator{
+		$sum = 0;
+		for($i = 1; $i <= $n; $i++){
+			$sum += (yield $i * $this->step) ?? 0;
+		}
+		return "sum=$sum";
+	}
 }

@@ -220,6 +220,25 @@ func (f *fctx) coerce(v value, to *api.Type) string {
 	if to.IsAny() || (to.K == api.KInterface && len(to.Methods) == 0) {
 		return v.code
 	}
+	// A plugin class where the server class it extends is wanted: the embedded value.
+	if c := f.cv.localClassOf(from); c != nil && to.K == api.KPointer && to.Elem.K == api.KNamed && !isArrayT(to) {
+		recv := paren(v, 7)
+		if c.Poly && from.K == api.KNamed && from.Name == c.IfaceName {
+			recv += "." + asMethod(c) + "()"
+		}
+		path := recv
+		for k := c; k != nil; k = k.Parent {
+			if k.ExtEmbed != nil {
+				if api.Identical(k.ExtEmbed, to.Elem) {
+					return "&" + path + "." + k.ExtEmbed.ObjName()
+				}
+				break
+			}
+			if k.Parent != nil {
+				path += "." + k.Parent.GoName
+			}
+		}
+	}
 	ut := f.underlying(to)
 	uf := f.underlying(from)
 	// From untyped values.

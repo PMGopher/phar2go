@@ -15,6 +15,7 @@ var (
 	throwableT = &api.Type{K: api.KNamed, Name: "phpx.Throwable", Iface: true}
 	exceptionT = api.Ptr(api.Named("phpx.Exception"))
 	entryT     = api.Named("phpx.Entry")
+	generatorT = api.Ptr(api.Named("phpx.Generator"))
 )
 
 // arrayT is a PHP array (*phpx.Array). k and v are the key and value types when known.
@@ -190,7 +191,9 @@ func (cv *converter) classRef(fqcn string, ctx *class) *api.Type {
 			return ctx.ExtParent
 		}
 		return api.Any
-	case "closure", "callable", "generator", "iterator", "traversable", "iteratoraggregate", "stdclass", "object", "mixed":
+	case "generator":
+		return generatorT
+	case "closure", "callable", "iterator", "traversable", "iteratoraggregate", "stdclass", "object", "mixed":
 		return api.Any
 	case "throwable", "exception", "error":
 		return throwableT
@@ -280,8 +283,11 @@ func (cv *converter) phpTypeNode(f *phpFile, n ast.Vertex, ctx *class) *api.Type
 			return api.Bool
 		case "void", "never":
 			return api.Void
-		case "array", "iterable":
+		case "array":
 			return arrayT(nil, nil)
+		case "iterable":
+			// An array or a generator.
+			return api.Any
 		case "mixed", "object", "callable", "null":
 			return api.Any
 		case "self", "static", "parent":
@@ -343,7 +349,11 @@ func (cv *converter) docTypeString(s string, ctx *class, f *phpFile) *api.Type {
 		base := strings.ToLower(s[:i])
 		args := splitTop(s[i+1:len(s)-1], ',')
 		switch base {
-		case "array", "list", "non-empty-array", "non-empty-list", "iterable", "\\generator", "generator", "\\traversable":
+		case "\\generator", "generator":
+			return generatorT
+		case "iterable", "\\traversable", "traversable":
+			return api.Any
+		case "array", "list", "non-empty-array", "non-empty-list":
 			var k, v *api.Type
 			if len(args) == 1 {
 				k, v = api.Int, cv.docTypeString(args[0], ctx, f)
@@ -377,8 +387,10 @@ func (cv *converter) docTypeString(s string, ctx *class, f *phpFile) *api.Type {
 		return api.String
 	case "bool", "boolean", "true", "false":
 		return api.Bool
-	case "array", "list", "non-empty-array", "non-empty-list", "iterable":
+	case "array", "list", "non-empty-array", "non-empty-list":
 		return arrayT(nil, nil)
+	case "iterable":
+		return api.Any
 	case "void", "never":
 		return api.Void
 	case "mixed", "object", "callable", "null", "resource", "scalar", "numeric", "array-key", "\\closure", "closure":

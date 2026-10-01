@@ -71,8 +71,8 @@ func (cv *converter) emitAll(res *Result) {
 		for _, s := range cv.staticVars {
 			if strings.Contains(s, "Unsupported(") {
 				// Never panic while the server starts.
-				name := strings.Fields(s)[1]
-				s = "var " + name + " any // TODO(phar2go): " + strings.TrimPrefix(s, "var "+name+" = ")
+				fields := strings.Fields(s)
+				s = "var " + fields[1] + " " + fields[2] + " // TODO(phar2go): " + s[strings.Index(s, " = ")+3:]
 			}
 			lines = append(lines, s)
 		}
@@ -762,7 +762,21 @@ func (cv *converter) emitBody(gf *goFile, f *fctx, m *method, header, doc string
 		results = " (" + strings.Join(named, ", ") + ")"
 		prologue = append([]string{"defer " + f.phpx("Recover") + "(&err)"}, prologue...)
 	}
+	if f.cls != nil && !m.Static && (cv.isEventHandler(f.cls, m) || m.GoName == "OnCommand") {
+		// An error in a handler is logged instead of stopping the server.
+		prologue = append([]string{"defer " + f.phpx("RecoverAndLog") + "(" + quote(f.cls.Short+"::"+m.Name+"()") + ")"}, prologue...)
+	}
+	isGen := containsYield(m.Body) && !m.Adopted
+	if isGen {
+		// The body runs in a generator: its returns are the generator's return value.
+		f.results = []*api.Type{api.Any}
+		f.retType = api.Any
+	}
 	f.inferLocals(m.Body)
+	if isGen {
+		// After the PHP variables are known, so the name is free.
+		f.genVar = f.uniqueLocal("gen")
+	}
 	for _, v := range f.vars {
 		gf.idents[v.goName] = true
 	}
@@ -775,8 +789,16 @@ func (cv *converter) emitBody(gf *goFile, f *fctx, m *method, header, doc string
 	}
 	body := f.block(m.Body)
 	decls := f.declareLocals(body)
-	if len(sig.Results) > 0 && !terminates(body) && !endsWithReturn(m.Body) {
+	if len(sig.Results) > 0 && !terminates(body) && !endsWithReturn(m.Body) && !isGen {
 		body += "\n" + f.returnStmt(nil)
+	}
+	if isGen {
+		inner := append(decls, body)
+		if !terminates(body) {
+			inner = append(inner, "return nil")
+		}
+		body = "return " + f.phpx("NewGenerator") + "(func(" + f.genVar + " *" + f.phpx("Yielder") + ") any {\n" + strings.Join(inner, "\n") + "\n})"
+		decls = nil
 	}
 	all := append(prologue, decls...)
 	if strings.TrimSpace(body) != "" {
@@ -942,4 +964,19 @@ func endsWithReturn(stmts []ast.Vertex) bool {
 	}
 	_, ok := stmts[len(stmts)-1].(*ast.StmtReturn)
 	return ok
+}
+
+// isEventHandler reports whether a method of a listener handles an event.
+func (cv *converter) isEventHandler(c *class, m *method) bool {
+	if !c.listener || m.Private || m.Protected || len(m.Sig.Params) != 1 || len(m.Sig.Results) != 0 {
+		return false
+	}
+	t := m.Sig.Params[0]
+	if t.K != api.KPointer || t.Elem.K != api.KNamed {
+		return false
+	}
+	if lc := cv.localClassOf(t); lc != nil {
+		return lc.isEvent
+	}
+	return strings.Contains(t.Elem.Name, "/pocketmine/event/")
 }

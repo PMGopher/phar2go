@@ -71,6 +71,8 @@ type fctx struct {
 	stmtNode ast.Vertex
 	// goArgs is set while converting the arguments of a call into the server.
 	goArgs bool
+	// genVar is the Yielder of the generator body being converted.
+	genVar string
 }
 
 type importSet struct {

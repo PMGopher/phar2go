@@ -2,6 +2,7 @@ package conv
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/VKCOM/php-parser/pkg/ast"
@@ -110,7 +111,7 @@ func (f *fctx) stmt(n ast.Vertex) string {
 				init = f.coerce(f.expr(s.Expr, l.t), l.t)
 			}
 			if !f.dry {
-				f.cv.staticVars = append(f.cv.staticVars, fmt.Sprintf("var %s = %s", pkgVar, strings.ReplaceAll(init, "\n", " ")))
+				f.cv.staticVars = append(f.cv.staticVars, fmt.Sprintf("var %s %s = %s", pkgVar, f.typeStr(l.t), strings.ReplaceAll(init, "\n", " ")))
 				f.cv.staticImports = append(f.cv.staticImports, f.imports)
 			}
 			l.goName = pkgVar
@@ -198,11 +199,17 @@ func (f *fctx) exprStmt(e ast.Vertex) string {
 	if v.code == "" {
 		return ""
 	}
+	if strings.Contains(v.code, f.phpx("Unsupported")+"(") && strings.HasPrefix(strings.TrimSpace(reTodo.ReplaceAllString(v.code, "")), f.phpx("Unsupported")+"(") {
+		// The result isn't used: skip the statement (with a warning) rather than stop.
+		return strings.Replace(v.code, f.phpx("Unsupported")+"(", f.phpx("Skipped")+"(", 1)
+	}
 	if v.call || v.t != nil && v.t.IsVoid() {
 		return v.code
 	}
 	return "_ = " + v.code
 }
+
+var reTodo = regexp.MustCompile(`^/\* TODO\(phar2go\):.*?\*/\s*`)
 
 func (f *fctx) ifStmt(x *ast.StmtIf) string {
 	var sb strings.Builder
@@ -277,6 +284,18 @@ func (f *fctx) foreachStmt(x *ast.StmtForeach) string {
 		e := f.newTmp("e")
 		var header string
 		var keyCode, valCode string
+		if api.Identical(c.t, generatorT) {
+			// Lazy: the generator runs as the loop goes.
+			gv := f.newTmp("g")
+			header = "for " + gv + " := " + c.code + "; " + gv + ".Valid(); " + gv + ".Next() {"
+			var lines []string
+			if x.Key != nil {
+				lines = append(lines, f.assignValue(x.Key, value{code: gv + ".Key()", t: api.Any, prec: 7}))
+			}
+			lines = append(lines, f.assignValue(x.Var, value{code: gv + ".Current()", t: api.Any, prec: 7}))
+			lines = append(lines, f.block(stmtList(x.Stmt)))
+			return header + "\n" + strings.Join(lines, "\n") + "\n}"
+		}
 		switch {
 		case isArrayT(c.t):
 			header = "for _, " + e + " := range " + paren(c, 7) + ".Entries() {"
@@ -714,8 +733,14 @@ func (f *fctx) closure(params []ast.Vertex, uses []ast.Vertex, retNode ast.Verte
 		}
 		ps = append(ps, pa)
 	}
+	isGen := arrow == nil && containsYield(stmts)
 	var sig *api.Func
-	if want != nil && want.K == api.KFunc {
+	if isGen && (want == nil || want.K != api.KFunc) {
+		sig = &api.Func{Results: []*api.Type{generatorT}}
+		for _, p := range ps {
+			sig.Params = append(sig.Params, p.Type)
+		}
+	} else if want != nil && want.K == api.KFunc {
 		sig = &api.Func{Params: want.Params, Results: want.Results, Variadic: want.Variadic}
 	} else {
 		sig = &api.Func{}
@@ -856,6 +881,23 @@ func (f *fctx) closure(params []ast.Vertex, uses []ast.Vertex, retNode ast.Verte
 				body = "_ = " + v.code
 			}
 		}
+	} else if isGen {
+		outerResults := sig.Results
+		g.results, g.retType = []*api.Type{api.Any}, api.Any
+		g.inferLocals(stmts)
+		g.genVar = g.uniqueLocal("gen")
+		inner := g.block(stmts)
+		innerDecls := g.declareLocals(inner)
+		if !terminates(inner) {
+			inner += "\nreturn nil"
+		}
+		genCode := g.phpx("NewGenerator") + "(func(" + g.genVar + " *" + g.phpx("Yielder") + ") any {\n" + strings.Join(append(innerDecls, inner), "\n") + "\n})"
+		if len(outerResults) > 0 {
+			body = "return " + g.coerce(value{code: genCode, t: generatorT, prec: 7}, outerResults[0])
+		} else {
+			body = "_ = " + genCode
+		}
+		g.order = nil
 	} else {
 		g.inferLocals(stmts)
 		body = g.block(stmts)

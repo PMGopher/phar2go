@@ -3,8 +3,10 @@ package phpx
 import (
 	"errors"
 	"fmt"
+	"os"
 	"runtime/debug"
 	"strings"
+	"sync"
 )
 
 // Throwable is PHP's Throwable: anything that can be thrown and caught.
@@ -265,4 +267,30 @@ func InstanceOfValue(v any, class string) bool {
 		t = AsThrowable(v)
 	}
 	return InstanceOf(t, class)
+}
+
+// LogError reports errors of converted code that were recovered; plugin.go sets it to the
+// plugin's logger.
+var LogError = func(msg string) { fmt.Fprintln(os.Stderr, msg) }
+
+// LogWarning reports skipped code; plugin.go sets it to the plugin's logger.
+var LogWarning = func(msg string) { fmt.Fprintln(os.Stderr, msg) }
+
+// RecoverAndLog recovers a panic in an event handler or command and logs it, so that an error
+// in the plugin doesn't stop the server. Use it as `defer phpx.RecoverAndLog("...")`.
+func RecoverAndLog(where string) {
+	if r := recover(); r != nil {
+		t := AsThrowable(r)
+		LogError(fmt.Sprintf("%s: %s", where, t.ToString()))
+	}
+}
+
+var skipped sync.Map
+
+// Skipped stands for a statement phar2go couldn't convert and whose result isn't used: it is
+// skipped with a warning (once per place) instead of stopping the plugin.
+func Skipped(what string, _ ...any) {
+	if _, seen := skipped.LoadOrStore(what, true); !seen {
+		LogWarning("phar2go: skipped code that couldn't be converted: " + what)
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"hash"
 	"hash/crc32"
 	"html"
+	"io"
 	"math/rand/v2"
 	"net"
 	"strconv"
@@ -965,7 +966,24 @@ func Levenshtein(a, b string, _ ...int) int {
 	}
 	return d[len(b)]
 }
-func Soundex(s string) string              { return s }
-func Metaphone(s string, _ ...int) string  { return s }
-func Fwrite(_ any, s string, _ ...int) any { Echo(s); return len(s) }
-func Fputs(h any, s string, _ ...int) any  { return Fwrite(h, s) }
+func Soundex(s string) string             { return s }
+func Metaphone(s string, _ ...int) string { return s }
+func Fwrite(h any, s string, _ ...int) any {
+	switch w := h.(type) {
+	case *FileHandle:
+		if w.f == nil {
+			return false
+		}
+		n, err := w.f.WriteString(s)
+		if err != nil {
+			return false
+		}
+		return n
+	case io.Writer:
+		n, _ := w.Write([]byte(s))
+		return n
+	}
+	Echo(s)
+	return len(s)
+}
+func Fputs(h any, s string, _ ...int) any { return Fwrite(h, s) }

@@ -58,6 +58,20 @@ class Main extends PluginBase{
 			default => "small",
 		};
 		$this->getLogger()->info("Shapes are $label, counter {$this->counter->get()}");
+		$gen = $this->counter->steps(3);
+		$seen = [];
+		while($gen->valid()){
+			$seen[] = $gen->current();
+			$gen->send(1);
+		}
+		$lazy = (function() : \Generator{
+			yield "a" => 1;
+			yield from ["b" => 2];
+		})();
+		foreach($lazy as $k => $v){
+			$seen[] = "$k$v";
+		}
+		$this->getLogger()->info("Generator: " . implode(",", $seen) . " " . $gen->getReturn());
 	}
 
 	private function risky(int $n) : int{

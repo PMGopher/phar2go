@@ -57,12 +57,24 @@ func (f *fctx) expr(n ast.Vertex, want *api.Type) value {
 	case *ast.ExprClassConstFetch:
 		return f.classConst(x)
 	case *ast.ExprMethodCall:
+		if x.EllipsisTkn != nil {
+			return f.methodCallable(x.Var, x.Method)
+		}
 		return f.methodCall(x.Var, x.Method, x.Args, false, n)
 	case *ast.ExprNullsafeMethodCall:
+		if x.EllipsisTkn != nil {
+			return f.methodCallable(x.Var, x.Method)
+		}
 		return f.methodCall(x.Var, x.Method, x.Args, true, n)
 	case *ast.ExprStaticCall:
+		if x.EllipsisTkn != nil {
+			return f.staticCallable(x)
+		}
 		return f.staticCall(x)
 	case *ast.ExprFunctionCall:
+		if x.EllipsisTkn != nil {
+			return f.funcCallable(x)
+		}
 		return f.funcCall(x, want)
 	case *ast.ExprNew:
 		return f.newExpr(x)
@@ -223,8 +235,23 @@ func (f *fctx) expr(n ast.Vertex, want *api.Type) value {
 		return callv(f.todo(n, "eval() isn't supported")+f.phpx("Unsupported")+`("eval")`, api.Any)
 	case *ast.ExprShellExec:
 		return callv(f.todo(n, "shell execution isn't supported")+f.phpx("Unsupported")+`("shell_exec")`, api.Any)
-	case *ast.ExprYield, *ast.ExprYieldFrom:
-		return callv(f.todo(n, "generators (yield) aren't supported")+f.phpx("Unsupported")+`("yield")`, api.Any)
+	case *ast.ExprYield:
+		if f.genVar == "" {
+			return callv(f.todo(n, "yield outside a generator")+f.phpx("Unsupported")+`("yield")`, api.Any)
+		}
+		k, v := "nil", "nil"
+		if x.Key != nil {
+			k = f.arrayElemCode(f.expr(x.Key, nil))
+		}
+		if x.Val != nil {
+			v = f.arrayElemCode(f.expr(x.Val, nil))
+		}
+		return callv(f.genVar+".Yield("+k+", "+v+")", api.Any)
+	case *ast.ExprYieldFrom:
+		if f.genVar == "" {
+			return callv(f.todo(n, "yield from outside a generator")+f.phpx("Unsupported")+`("yield from")`, api.Any)
+		}
+		return callv(f.genVar+".YieldFrom("+f.expr(x.Expr, nil).code+")", api.Any)
 	}
 	return callv(f.todo(n, "unsupported expression %T", n)+f.phpx("Unsupported")+`("expression")`, api.Any)
 }
@@ -1399,4 +1426,94 @@ func (f *fctx) match(x *ast.ExprMatch, want *api.Type) value {
 	}
 	sb.WriteString("}()")
 	return callv(sb.String(), t)
+}
+
+func funcTypeOf(sig *api.Func) *api.Type {
+	return &api.Type{K: api.KFunc, Params: sig.Params, Results: sig.Results, Variadic: sig.Variadic}
+}
+
+// methodCallable converts $obj->method(...): a Go method value.
+func (f *fctx) methodCallable(objN, nameN ast.Vertex) value {
+	name := identValue(nameN)
+	isThis := varName(objN) == "this" && f.cls != nil && !f.static
+	var obj value
+	if isThis {
+		obj = prim(f.recv, api.Ptr(api.Named(f.cls.GoName)))
+	} else {
+		obj = f.expr(objN, nil)
+	}
+	if name != "" {
+		if c := f.cv.localClassOf(obj.t); c != nil {
+			if m := c.findMethodIfaces(name); m != nil && !m.Static && m.Sig != nil {
+				recv := paren(obj, 7)
+				isIface := obj.t.K == api.KNamed && (c.Kind == kindInterface || c.Poly && obj.t.Name == c.IfaceName)
+				switch {
+				case isThis && c.Poly && !m.Private && f.selfVar != "":
+					recv = f.selfVar
+				case isIface && m.Private && c.Poly:
+					recv += "." + asMethod(c) + "()"
+				}
+				return prim(recv+"."+m.GoName, funcTypeOf(m.Sig))
+			}
+		}
+		if obj.t != nil && !isAny(obj.t) && !isArrayT(obj.t) {
+			ms := f.cv.methodSet(obj.t)
+			if gn := findMethodName(ms, name); gn != "" {
+				return prim(paren(obj, 7)+"."+gn, funcTypeOf(ms[gn]))
+			}
+		}
+	}
+	nameCode := quote(name)
+	if name == "" {
+		nameCode = f.coerce(f.expr(nameN, api.String), api.String)
+	}
+	return callv(f.phpx("Callable")+"("+obj.code+", "+nameCode+")", api.Any)
+}
+
+// staticCallable converts Class::method(...).
+func (f *fctx) staticCallable(x *ast.ExprStaticCall) value {
+	name := identValue(x.Call)
+	c, php, kind := f.staticClass(x.Class)
+	if c != nil {
+		if m := c.findMethod(name); m != nil && m.Sig != nil {
+			if m.Static {
+				return prim(m.GoName, funcTypeOf(m.Sig))
+			}
+			if !f.static && f.cls != nil {
+				recv := f.recv
+				if kind == "parent" || c != f.cls {
+					recv += "." + c.GoName
+				}
+				return prim(recv+"."+m.GoName, funcTypeOf(m.Sig))
+			}
+		}
+	}
+	cls := quote(php)
+	if c != nil {
+		cls = quote(c.FQCN)
+	} else if kind == "dynamic" {
+		cls = f.expr(x.Class, nil).code
+	}
+	return callv(f.phpx("StaticCallable")+"("+cls+", "+quote(name)+")", api.Any)
+}
+
+// funcCallable converts strlen(...) and myFunction(...).
+func (f *fctx) funcCallable(x *ast.ExprFunctionCall) value {
+	switch x.Function.(type) {
+	case *ast.Name, *ast.NameFullyQualified, *ast.NameRelative:
+	default:
+		return f.expr(x.Function, nil)
+	}
+	name := strings.ToLower(lastSeg(identValue(x.Function)))
+	if fn, ok := f.cv.funcs[name]; ok {
+		return prim(fn.GoName, funcTypeOf(fn.m.Sig))
+	}
+	goName := phpxFuncName(name)
+	if r, ok := phpxRenames[name]; ok {
+		goName = r
+	}
+	if fn, ok := f.cv.idx.Packages[api.PhpxPath].Funcs[goName]; ok && fn.TypeParams == 0 {
+		return prim(f.phpx(goName), funcTypeOf(fn))
+	}
+	return callv(f.todo(x, "function %s() isn't supported", name)+f.phpx("Unsupported")+"("+quote(name)+")", api.Any)
 }

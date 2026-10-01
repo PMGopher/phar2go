@@ -45,6 +45,9 @@ func methodByPHPName(v reflect.Value, name string) reflect.Value {
 
 // Call is $obj->method(...$args) on a value whose type isn't known when converting.
 func Call(obj any, method string, args ...any) any {
+	if _, ok := obj.(*StubObject); ok {
+		return nil
+	}
 	if IsNull(obj) {
 		Throw(NewError("Error", fmt.Sprintf("Call to a member function %s() on null", method)))
 	}
@@ -184,6 +187,9 @@ func Prop(obj any, name string) any {
 
 // SetProp is $obj->name = $value on a value whose type isn't known when converting.
 func SetProp(obj any, name string, value any) any {
+	if _, ok := obj.(*StubObject); ok {
+		return value
+	}
 	if f, ok := fieldByPHPName(obj, name); ok {
 		if v, ok := convertTo(value, f.Type()); ok {
 			f.Set(v)
@@ -443,4 +449,34 @@ func Args(parts ...any) []any {
 		out = append(out, p)
 	}
 	return out
+}
+
+// Callable is $obj->method(...) (a first-class callable) on a value whose type isn't known
+// when converting.
+func Callable(obj any, method string) func(args ...any) any {
+	return func(args ...any) any { return Call(obj, method, args...) }
+}
+
+// StaticCallable is Class::method(...) with a class known at run time.
+func StaticCallable(class any, method string) func(args ...any) any {
+	return func(args ...any) any { return CallStatic(class, method, args...) }
+}
+
+// StubObject stands for an object of a PocketMine-MP class that pocketmine-go doesn't have and
+// that only affects what clients see (network packets and their data types). Its methods do
+// nothing and return null.
+type StubObject struct{ Class string }
+
+func (s *StubObject) PhpClass() string { return s.Class }
+
+// Stub creates a StubObject (new Packet(...), Packet::create(...)), warning once per class.
+func Stub(what string, _ ...any) any {
+	if _, seen := skipped.LoadOrStore("stub:"+what, true); !seen {
+		LogWarning("phar2go: " + what + " has no pocketmine-go equivalent; it is ignored")
+	}
+	class := what
+	if i := strings.Index(what, "::"); i >= 0 {
+		class = what[:i]
+	}
+	return &StubObject{Class: strings.TrimPrefix(class, "new ")}
 }
