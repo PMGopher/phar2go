@@ -151,6 +151,9 @@ func (f *fctx) argCode(e ast.Vertex, pt *api.Type, m *method, i int) string {
 	}
 	v := f.expr(e, pt)
 	if pt != nil && pt.IsAny() {
+		if f.goArgs && isArrayT(v.t) {
+			return f.phpx("ToGo") + "(" + v.code + ")"
+		}
 		return f.arrayElemCode(v)
 	}
 	if isArrayT(pt) && isArrayT(v.t) && v.lvalue {
@@ -348,13 +351,7 @@ func (f *fctx) callOn(obj value, name string, args []ast.Vertex, isThis bool, n 
 		}
 	}
 	if gn := findMethodName(ms, name, extra...); gn != "" {
-		sig := ms[gn]
-		if len(sig.Results) == 0 && n != f.stmtNode && !t.IsAny() {
-			// PHP's fluent setters return $this; Go's return nothing.
-			tmp := f.newTmp("o")
-			return callv(fmt.Sprintf("func() %s {\n%s := %s\n%s.%s(%s)\nreturn %s\n}()", f.typeStr(t), tmp, obj.code, tmp, gn, f.callArgs(sig, args, nil), tmp), t)
-		}
-		return f.callResults(recv+"."+gn+"("+f.callArgs(sig, args, nil)+")", sig.Results)
+		return f.fluentOrCall(obj.code, t, gn, ms[gn], args, n)
 	}
 	// A getter of a field: $pos->getX() -> pos.X, $loc->getWorld() -> loc.World.
 	if len(args) == 0 && len(name) > 3 && strings.EqualFold(name[:3], "get") {
@@ -364,15 +361,48 @@ func (f *fctx) callOn(obj value, name string, args []ast.Vertex, isThis bool, n 
 			}
 		}
 	}
-	// An interface without the method: assert to the concrete type that has it.
+	// An interface without the method: assert to the concrete type that has it, a class of
+	// the plugin first (a plugin.Plugin that is the plugin's main class).
 	if f.cv.isInterface(t) {
+		if c := f.cv.localImplementor(t, name); c != nil {
+			ct := f.cv.classType(c)
+			sig := f.cv.methodSet(ct)[c.findMethod(name).GoName]
+			return f.methodResult(recv+".("+f.typeStr(ct)+")."+c.findMethod(name).GoName+"("+f.callArgs(sig, args, c.findMethod(name))+")", c.findMethod(name))
+		}
 		if ct, gn := f.cv.concreteFor(t, goMethodNames(name)); ct != nil {
 			sig := f.cv.methodSet(ct)[gn]
-			return f.callResults(recv+".("+f.typeStr(ct)+")."+gn+"("+f.callArgs(sig, args, nil)+")", sig.Results)
+			return f.fluentOrCall(recv+".("+f.typeStr(ct)+")", ct, gn, sig, args, n)
 		}
 	}
 	f.warn(n, "method %s() not found on %s in pocketmine-go; it is called dynamically", name, strings.TrimPrefix(f.cv.prettyType(t), "*"))
 	return callv(f.phpx("Call")+"("+obj.code+", "+quote(name)+f.anyArgs(args)+")", api.Any)
+}
+
+// fluentOrCall calls a server method; PHP's fluent setters return $this where Go's return
+// nothing, so a void method used as a value returns its receiver.
+func (f *fctx) fluentOrCall(recv string, t *api.Type, gn string, sig *api.Func, args []ast.Vertex, n ast.Vertex) value {
+	if len(sig.Results) == 0 && n != f.stmtNode && !t.IsAny() {
+		f.goArgs = true
+		argCode := f.callArgs(sig, args, nil)
+		f.goArgs = false
+		tmp := f.newTmp("o")
+		return callv(fmt.Sprintf("func() %s {\n%s := %s\n%s.%s(%s)\nreturn %s\n}()", f.typeStr(t), tmp, recv, tmp, gn, argCode, tmp), t)
+	}
+	return f.serverCall(paren(value{code: recv, prec: 7}, 7)+"."+gn, sig, args)
+}
+
+// serverCall converts the arguments and results of a call into the server: PHP arrays
+// passed as `any` become Go values, and `any` results become PHP values.
+func (f *fctx) serverCall(code string, sig *api.Func, args []ast.Vertex) value {
+	saved := f.goArgs
+	f.goArgs = true
+	argCode := f.callArgs(sig, args, nil)
+	f.goArgs = saved
+	v := f.callResults(code+"("+argCode+")", sig.Results)
+	if v.t != nil && v.t.IsAny() && len(sig.Results) > 0 {
+		v.code = f.phpx("FromGo") + "(" + v.code + ")"
+	}
+	return v
 }
 
 // methodResult is the value of a call to a plugin method (whose Go signature may have been
@@ -612,7 +642,7 @@ func (f *fctx) extStaticCall(php, name string, args []ast.Vertex, n ast.Vertex) 
 	if target, ok := f.cv.idx.PHPMembers[key]; ok {
 		if fn := f.cv.idx.Func(target); fn != nil && fn.TypeParams == 0 {
 			i := strings.LastIndexByte(target, '.')
-			return f.callResults(f.pkgRef(target[:i])+"."+target[i+1:]+"("+f.callArgs(fn, args, nil)+")", fn.Results)
+			return f.serverCall(f.pkgRef(target[:i])+"."+target[i+1:], fn, args)
 		}
 	}
 	pkg := f.cv.extPackage(php)
@@ -637,7 +667,15 @@ func (f *fctx) extStaticCall(php, name string, args []ast.Vertex, n ast.Vertex) 
 		singular := strings.TrimSuffix(short, "s")
 		for _, cand := range []string{singular, strings.TrimSuffix(singular, "e"), "Get" + singular} {
 			if fn, ok := pkg.Funcs[cand]; ok && len(fn.Params) == 1 && fn.Params[0].IsString() && len(fn.Results) > 0 {
-				return f.callResults(ref+cand+"("+quote(strings.ToLower(name))+")", fn.Results)
+				v := f.callResults(ref+cand+"("+quote(strings.ToLower(name))+")", fn.Results)
+				// The concrete type of the entry, when the registry returns an interface.
+				if ti, ok := pkg.Types[pascal(strings.ToLower(name))]; ok && !ti.Interface && ti.Underlying.K == api.KStruct && f.cv.isInterface(v.t) {
+					ct := api.Ptr(api.Named(pkg.Path + "." + pascal(strings.ToLower(name))))
+					if f.cv.implements(ct, v.t) {
+						return callv(f.phpx("As")+"["+f.typeStr(ct)+"]("+v.code+")", ct)
+					}
+				}
+				return v
 			}
 		}
 	}
@@ -658,7 +696,9 @@ func (f *fctx) extStaticCall(php, name string, args []ast.Vertex, n ast.Vertex) 
 			if fn, ok := pkg.Funcs["GetInstance"]; ok {
 				return f.callResults(ref+"GetInstance()", fn.Results)
 			}
-			return callv(f.todo(n, "Server::getInstance() has no equivalent; pass the server from your plugin (GetServer())")+f.phpx("Unsupported")+`("Server::getInstance")`, api.Any)
+			// The server that loaded the plugin (see phar2go_runtime.go).
+			f.cv.usesServer = true
+			return callv("phar2goServer()", api.Ptr(api.Named(f.cv.idx.Module+"/pocketmine/server.Server")))
 		}
 	}
 	cands := []string{typeName + pascal(name), pascal(name) + typeName, short + pascal(name), pascal(name)}
@@ -667,7 +707,7 @@ func (f *fctx) extStaticCall(php, name string, args []ast.Vertex, n ast.Vertex) 
 	}
 	for _, cand := range cands {
 		if fn, ok := pkg.Funcs[cand]; ok && fn.TypeParams == 0 {
-			return f.callResults(ref+cand+"("+f.callArgs(fn, args, nil)+")", fn.Results)
+			return f.serverCall(ref+cand, fn, args)
 		}
 	}
 	return callv(f.todo(n, "static method %s::%s() has no pocketmine-go equivalent", php, name)+f.phpx("Unsupported")+"("+quote(php+"::"+name)+f.anyArgs(args)+")", api.Any)
@@ -783,7 +823,7 @@ func (f *fctx) newExt(php string, args []ast.Vertex, n ast.Vertex) value {
 		if !fn.Variadic && nargs > len(fn.Params) {
 			continue
 		}
-		return f.callResults(ref+c+"("+f.callArgs(fn, args, nil)+")", fn.Results)
+		return f.serverCall(ref+c, fn, args)
 	}
 	if t != nil {
 		if ti := f.cv.typeInfo(t.Deref()); ti != nil && !ti.Interface && ti.Underlying.K == api.KStruct {
@@ -793,4 +833,31 @@ func (f *fctx) newExt(php string, args []ast.Vertex, n ast.Vertex) value {
 		}
 	}
 	return callv(f.todo(n, "no Go constructor found for %s", php)+f.phpx("Unsupported")+"("+quote("new "+php)+f.anyArgs(args)+")", api.Any)
+}
+
+// localImplementor finds the plugin class with method name that a value of interface type t
+// most likely holds (the main class first).
+func (cv *converter) localImplementor(t *api.Type, name string) *class {
+	var found []*class
+	for _, c := range cv.classList {
+		if c.Kind != kindClass || c.Abstract {
+			continue
+		}
+		m := c.findMethod(name)
+		if m == nil || m.Static || m.Private {
+			continue
+		}
+		if cv.implements(cv.classType(c), t) {
+			found = append(found, c)
+		}
+	}
+	for _, c := range found {
+		if strings.EqualFold(c.FQCN, cv.opts.MainClass) {
+			return c
+		}
+	}
+	if len(found) == 1 {
+		return found[0]
+	}
+	return nil
 }

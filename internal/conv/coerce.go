@@ -1,6 +1,7 @@
 package conv
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/PMGopher/phar2go/internal/api"
@@ -54,6 +55,13 @@ func (f *fctx) typeStr(t *api.Type) string {
 		if t.Name == "error" {
 			return "error"
 		}
+		if n := t.ObjName(); n != "" && n[0] >= 'a' && n[0] <= 'z' && t.PkgPath() != "" && t.PkgPath() != api.PhpxPath {
+			// An unexported type of the server: an interface can be written out as a literal.
+			if ti := f.cv.typeInfo(t); ti != nil && ti.Interface && !ti.Unexported {
+				return f.typeStr(&api.Type{K: api.KInterface, Methods: ti.Methods})
+			}
+			return "any"
+		}
 		i := strings.LastIndexByte(t.Name, '.')
 		name := t.Name
 		if i >= 0 {
@@ -90,6 +98,7 @@ func (f *fctx) typeStr(t *api.Type) string {
 		for n, m := range t.Methods {
 			ms = append(ms, n+f.sigStr(m, nil))
 		}
+		sort.Strings(ms)
 		return "interface{ " + strings.Join(ms, "; ") + " }"
 	case api.KStruct:
 		return "struct{}"

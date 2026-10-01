@@ -34,15 +34,15 @@ type class struct {
 	IfaceNames []string // FQCNs of implemented (or, for interfaces, extended) interfaces
 	TraitNames []string
 
-	Parent      *class    // local parent
-	ExtParent   *api.Type // external parent (named type of the server), or nil
-	ExtParentPH string    // PHP name of the external parent
-	ExtEmbed    *api.Type // the type embedded for ExtParent (a struct)
-	Ifaces      []*class
-	ExtIfaces   []*api.Type
-	ExtTraits   []*api.Type // server structs embedded for `use SomeTrait` (CancellableTrait)
-	isEvent     bool
-	Subclasses  []*class
+	Parent       *class    // local parent
+	ExtParent    *api.Type // external parent (named type of the server), or nil
+	ExtParentPH  string    // PHP name of the external parent
+	ExtEmbed     *api.Type // the type embedded for ExtParent (a struct)
+	Ifaces       []*class
+	ExtIfaces    []*api.Type
+	ExtTraits    []*api.Type // server structs embedded for `use SomeTrait` (CancellableTrait)
+	isEvent      bool
+	Subclasses   []*class
 	Implementors []*class
 
 	Consts      []*constDecl
@@ -66,15 +66,17 @@ type class struct {
 
 	listener bool
 	noInit   bool
+	// adapters are methods generated to satisfy interfaces (Go name -> how to implement it).
+	adapters []*adapter
 	anonID   int
 }
 
 type constDecl struct {
-	Name   string
-	GoName string
-	Expr   ast.Vertex
-	Class  *class
-	Type   *api.Type
+	Name    string
+	GoName  string
+	Expr    ast.Vertex
+	Class   *class
+	Type    *api.Type
 	isConst bool
 }
 
@@ -91,6 +93,8 @@ type prop struct {
 	Promoted bool
 	Readonly bool
 	File     *phpFile
+	// Base is the parent's property this one redeclares (the Go field is the parent's).
+	Base *prop
 }
 
 type param struct {
@@ -135,6 +139,17 @@ type enumCase struct {
 	Name   string
 	GoName string
 	Value  ast.Vertex
+}
+
+// adapter is a method generated so that a class implements an interface method it gets from
+// the server type it extends under another name, or doesn't have at all.
+type adapter struct {
+	GoName string
+	Sig    *api.Func
+	// Target is the Go method that implements it ("" when there is none).
+	Target    string
+	TargetSig *api.Func
+	PHPName   string
 }
 
 // function is a plugin function declared outside a class.

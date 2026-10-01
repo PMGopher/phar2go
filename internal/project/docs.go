@@ -24,6 +24,7 @@ func readme(r *Report) string {
 		sb.WriteString("\n")
 	}
 	sb.WriteString("## Developing\n\nWith a clone of pocketmine-go next to this folder (see `go.work`):\n\n```bash\ngo vet ./...\ngo test ./...\n```\n\n")
+	fmt.Fprintf(&sb, "The converted code is in `internal/%s`, one file per PHP class file. ", r.Package)
 	sb.WriteString("`internal/phpx` is the small runtime the converted code uses for PHP's arrays, loose\ncomparisons and standard functions. See [CONVERSION.md](CONVERSION.md) for what to check by hand.\n")
 	return sb.String()
 }
@@ -38,7 +39,7 @@ func conversionReport(r *Report) string {
 		return sb.String()
 	}
 	if r.TODOs > 0 {
-		sb.WriteString("Code marked `TODO(phar2go)` couldn't be converted; it throws an error if it runs. Search for it:\n\n```bash\ngrep -rn \"TODO(phar2go)\" *.go\n```\n\n")
+		sb.WriteString("Code marked `TODO(phar2go)` couldn't be converted; it throws an error if it runs. Search for it:\n\n```bash\ngrep -rn \"TODO(phar2go)\" internal/\n```\n\n")
 	}
 	if len(r.External) > 0 {
 		sb.WriteString("## Classes that pocketmine-go doesn't have\n\nThese come from PocketMine-MP or from libraries (virions) that weren't bundled in the phar.\nCode using them needs to be rewritten:\n\n")

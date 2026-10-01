@@ -25,6 +25,9 @@ type Index struct {
 	// PHPMembers maps "lower-case class::member" to a Go function ("pkg.Func") or method
 	// ("pkg.Type.Method") that is a port of it.
 	PHPMembers map[string]string `json:"php_members"`
+	// PHPConsts are constants of PocketMine-MP classes ("lower-case class::NAME") with literal
+	// values, used when pocketmine-go has no Go constant for them.
+	PHPConsts map[string]PHPConst `json:"php_consts,omitempty"`
 }
 
 // Package is one Go package of the server.

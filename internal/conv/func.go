@@ -69,6 +69,8 @@ type fctx struct {
 	selfVar string
 	// stmtNode is the expression being converted as a statement (its value is unused).
 	stmtNode ast.Vertex
+	// goArgs is set while converting the arguments of a call into the server.
+	goArgs bool
 }
 
 type importSet struct {
@@ -77,7 +79,9 @@ type importSet struct {
 	idents map[string]bool
 }
 
-func newImportSet() *importSet { return &importSet{paths: map[string]bool{}, idents: map[string]bool{}} }
+func newImportSet() *importSet {
+	return &importSet{paths: map[string]bool{}, idents: map[string]bool{}}
+}
 
 // pkgRef returns a placeholder for a package-qualified name, resolved when the file is written.
 func (f *fctx) pkgRef(path string) string {
@@ -124,6 +128,7 @@ func (f *fctx) newTmp(prefix string) string {
 func (f *fctx) child() *fctx {
 	c := &fctx{cv: f.cv, cls: f.cls, m: f.m, file: f.file, recv: f.recv, static: f.static, parent: f,
 		vars: map[string]*local{}, imports: f.imports, tmp: f.tmp, dry: f.dry, labelN: f.labelN, selfVar: f.selfVar}
+	c.goArgs = false
 	return c
 }
 

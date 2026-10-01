@@ -119,9 +119,9 @@ func readPhar(data []byte, haltAt int) (*Archive, error) {
 		return nil, fmt.Errorf("bad phar manifest: %w", r.err)
 	}
 	type entry struct {
-		name           string
-		size, csize    uint32
-		crc, flags     uint32
+		name        string
+		size, csize uint32
+		crc, flags  uint32
 	}
 	entries := make([]entry, 0, count)
 	for i := 0; i < count; i++ {

@@ -13,19 +13,19 @@ import (
 type Kind uint8
 
 const (
-	KInvalid Kind = iota
-	KBasic        // Name: int, string, bool, float64, ...
-	KNamed        // Name: "<pkg path>.<Name>", Args: type arguments
-	KPointer      // Elem
-	KSlice        // Elem
-	KArray        // Elem, Len
-	KMap          // Key, Elem
-	KFunc         // Params, Results, Variadic
-	KInterface    // Methods (an interface literal: any, interface{ M() })
-	KStruct       // a struct literal
-	KChan         // Elem
-	KTypeParam    // Name
-	KTuple        // Results: several results of a call
+	KInvalid   Kind = iota
+	KBasic          // Name: int, string, bool, float64, ...
+	KNamed          // Name: "<pkg path>.<Name>", Args: type arguments
+	KPointer        // Elem
+	KSlice          // Elem
+	KArray          // Elem, Len
+	KMap            // Key, Elem
+	KFunc           // Params, Results, Variadic
+	KInterface      // Methods (an interface literal: any, interface{ M() })
+	KStruct         // a struct literal
+	KChan           // Elem
+	KTypeParam      // Name
+	KTuple          // Results: several results of a call
 )
 
 // Type is a Go type. It is a small, serialisable stand-in for go/types.Type.
@@ -69,12 +69,14 @@ var (
 	Void       = &Type{K: KTuple}
 )
 
-func Ptr(t *Type) *Type        { return &Type{K: KPointer, Elem: t} }
-func SliceOf(t *Type) *Type    { return &Type{K: KSlice, Elem: t} }
-func MapOf(k, v *Type) *Type   { return &Type{K: KMap, Key: k, Elem: v} }
-func Named(name string) *Type  { return &Type{K: KNamed, Name: name} }
-func Basic(name string) *Type  { return &Type{K: KBasic, Name: name} }
-func FuncType(f *Func) *Type   { return &Type{K: KFunc, Params: f.Params, Results: f.Results, Variadic: f.Variadic} }
+func Ptr(t *Type) *Type       { return &Type{K: KPointer, Elem: t} }
+func SliceOf(t *Type) *Type   { return &Type{K: KSlice, Elem: t} }
+func MapOf(k, v *Type) *Type  { return &Type{K: KMap, Key: k, Elem: v} }
+func Named(name string) *Type { return &Type{K: KNamed, Name: name} }
+func Basic(name string) *Type { return &Type{K: KBasic, Name: name} }
+func FuncType(f *Func) *Type {
+	return &Type{K: KFunc, Params: f.Params, Results: f.Results, Variadic: f.Variadic}
+}
 func (t *Type) IsAny() bool    { return t != nil && t.K == KInterface && len(t.Methods) == 0 }
 func (t *Type) IsVoid() bool   { return t != nil && t.K == KTuple && len(t.Results) == 0 }
 func (t *Type) IsNil() bool    { return t != nil && t.K == KBasic && t.Name == "untyped nil" }

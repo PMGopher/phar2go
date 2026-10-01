@@ -96,7 +96,11 @@ func genPackage(idx *Index, p *packages.Package) {
 	for _, name := range scope.Names() {
 		obj := scope.Lookup(name)
 		if !obj.Exported() {
-			continue
+			// Unexported interfaces appear in exported signatures; a plugin can still satisfy
+			// them with a literal interface type.
+			if tn, ok := obj.(*types.TypeName); !ok || tn.IsAlias() || !types.IsInterface(tn.Type()) {
+				continue
+			}
 		}
 		switch o := obj.(type) {
 		case *types.TypeName:

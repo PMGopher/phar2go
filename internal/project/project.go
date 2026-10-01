@@ -34,30 +34,30 @@ type Options struct {
 
 // Report describes a finished conversion.
 type Report struct {
-	Out        string
-	Plugin     string
-	Version    string
-	Module     string
-	Package    string
-	MainType   string
-	Files      []string
-	Warnings   []string
-	TODOs      int
-	Classes    int
-	Methods    int
-	External   []string
-	PHPFiles   int
-	Resources  int
-	Commands   []string
+	Out       string
+	Plugin    string
+	Version   string
+	Module    string
+	Package   string
+	MainType  string
+	Files     []string
+	Warnings  []string
+	TODOs     int
+	Classes   int
+	Methods   int
+	External  []string
+	PHPFiles  int
+	Resources int
+	Commands  []string
 }
 
 type pluginYML struct {
-	Name     string `yaml:"name"`
-	Main     string `yaml:"main"`
-	Version  any    `yaml:"version"`
-	Author   string `yaml:"author"`
-	Authors  any    `yaml:"authors"`
-	SrcNS    string `yaml:"src-namespace-prefix"`
+	Name     string         `yaml:"name"`
+	Main     string         `yaml:"main"`
+	Version  any            `yaml:"version"`
+	Author   string         `yaml:"author"`
+	Authors  any            `yaml:"authors"`
+	SrcNS    string         `yaml:"src-namespace-prefix"`
 	Commands map[string]any `yaml:"commands"`
 }
 
@@ -159,8 +159,9 @@ func Convert(idx *api.Index, input string, opts Options) (*Report, error) {
 	sort.Strings(rep.Commands)
 
 	w := &writer{out: out}
+	// The converted code is one package in internal/<package>; the root only registers it.
 	for name, data := range res.Files {
-		w.write(name, data)
+		w.write(path.Join("internal", pkg, name), data)
 	}
 	// plugin.yml with main pointing at the Go type, for pocketmine-go's API.
 	yml, apiChanged := rewriteAPI(rewriteMain(ymlData, pkg+"."+mainType))
@@ -175,7 +176,7 @@ func Convert(idx *api.Index, input string, opts Options) (*Report, error) {
 	if len(resources) > 0 {
 		embed += " resources"
 	}
-	w.write("plugin.go", []byte(pluginGo(pkg, desc.Name, mainType, embed)))
+	w.write("plugin.go", []byte(pluginGo(pkg, module, desc.Name, mainType, embed, res.UsesServer)))
 	w.write("plugin_test.go", []byte(pluginTest(pkg, desc.Name)))
 	goVersion := opts.GoVersion
 	if goVersion == "" {
@@ -189,6 +190,9 @@ func Convert(idx *api.Index, input string, opts Options) (*Report, error) {
 			return err
 		}
 		data, _ := phpx.Source.ReadFile(p)
+		if strings.HasSuffix(p, ".go") {
+			data = []byte(strings.ReplaceAll(string(data), "github.com/PMGopher/phar2go/runtime/phpx", module+"/internal/phpx"))
+		}
 		w.write(path.Join("internal", "phpx", p), data)
 		return nil
 	})
@@ -318,15 +322,20 @@ func modulePart(s string) string {
 	return strings.Trim(sb.String(), "-._")
 }
 
-func pluginGo(pkg, name, mainType, embed string) string {
+func pluginGo(pkg, module, name, mainType, embed string, usesServer bool) string {
+	create := "return code.New" + mainType + "()"
+	if usesServer {
+		create = "p := code.New" + mainType + "()\n\t\tcode.PluginInstance = p\n\t\treturn p"
+	}
 	return fmt.Sprintf(`// Package %s is the %s plugin for pocketmine-go, converted from PocketMine-MP by phar2go.
 //
-// Add it to a server: see README.md.
+// The plugin's code is in internal/%s. Add the plugin to a server: see README.md.
 package %s
 
 import (
 	"embed"
 
+	code "%s/internal/%s"
 	"pocketmine-go/pocketmine/plugin"
 )
 
@@ -338,9 +347,11 @@ var files embed.FS
 
 // init registers the plugin when the server imports this package.
 func init() {
-	plugin.RegisterGoPlugin(files, func() plugin.Plugin { return New%s() })
+	plugin.RegisterGoPlugin(files, func() plugin.Plugin {
+		%s
+	})
 }
-`, pkg, name, pkg, embed, mainType)
+`, pkg, name, pkg, pkg, module, pkg, embed, create)
 }
 
 func pluginTest(pkg, name string) string {

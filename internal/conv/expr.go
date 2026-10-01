@@ -727,7 +727,7 @@ func (f *fctx) propFetch(objN, propN ast.Vertex, nullsafe bool) value {
 	}
 	if varName(objN) == "this" && f.cls != nil && !f.static {
 		if p := f.cls.findProp(name); p != nil && !p.Static {
-			return value{code: f.recv + "." + p.GoName, t: p.Type, prec: 7, lvalue: true}
+			return f.propValue(f.recv, p)
 		}
 		if f.cls.Kind == kindEnum {
 			switch name {
@@ -750,6 +750,16 @@ func (f *fctx) propFetch(objN, propN ast.Vertex, nullsafe bool) value {
 		return callv(fmt.Sprintf("func() %s { %s := %s; if %s(%s) { return nil }; return %s }()", f.typeStr(t), tmp, obj.code, f.phpx("IsNull"), tmp, f.coerce(innerTmp, t)), t)
 	}
 	return f.fieldOf(obj, name, propN)
+}
+
+// propValue reads a property; a redeclared property with a narrower type is asserted.
+func (f *fctx) propValue(recv string, p *prop) value {
+	v := value{code: recv + "." + p.GoName, t: p.Type, prec: 7, lvalue: true}
+	if p.Base != nil && !api.Identical(p.Base.Type, p.Type) {
+		base := value{code: v.code, t: p.Base.Type, prec: 7}
+		return value{code: f.coerce(base, p.Type), t: p.Type, prec: 7}
+	}
+	return v
 }
 
 func (f *fctx) enumValueType(c *class) *api.Type {
@@ -779,7 +789,7 @@ func (f *fctx) fieldOf(obj value, name string, n ast.Vertex) value {
 			if c.Poly && t.Name == c.IfaceName {
 				recv += "." + asMethod(c) + "()"
 			}
-			return value{code: recv + "." + p.GoName, t: p.Type, prec: 7, lvalue: true}
+			return f.propValue(recv, p)
 		}
 		if c.Poly && t.Name == c.IfaceName {
 			// A property of a subclass: read it dynamically.
@@ -890,7 +900,7 @@ func (f *fctx) extConst(php, name string) (value, bool) {
 	}
 	pkg := f.cv.extPackage(php)
 	if pkg == nil {
-		return value{}, false
+		return f.phpConst(php, name)
 	}
 	short := lastSeg(php)
 	var cands []string
@@ -915,7 +925,28 @@ func (f *fctx) extConst(php, name string) (value, bool) {
 			}
 		}
 	}
-	return value{}, false
+	return f.phpConst(php, name)
+}
+
+// phpConst is the literal value of a PocketMine-MP constant pocketmine-go doesn't have.
+func (f *fctx) phpConst(php, name string) (value, bool) {
+	c, ok := f.cv.idx.PHPConsts[strings.ToLower(strings.TrimPrefix(php, "\\")+"::"+name)]
+	if !ok {
+		return value{}, false
+	}
+	switch c.Kind {
+	case "int":
+		return value{code: c.Value, t: api.Int, prec: 7, konst: true}, true
+	case "float":
+		code := c.Value
+		if !strings.ContainsAny(code, ".eE") {
+			code += ".0"
+		}
+		return value{code: code, t: api.Float, prec: 7, konst: true}, true
+	case "bool":
+		return prim(c.Value, api.Bool), true
+	}
+	return prim(quote(c.Value), api.String), true
 }
 
 // cast converts (int)/(float)/(string)/(bool) casts.
@@ -984,7 +1015,7 @@ func (f *fctx) div(ln, rn ast.Vertex) value {
 		if !(l.t.IsFloat() && l.t.Name == "float64") && !l.konst {
 			lc = "float64(" + l.code + ")"
 		} else if l.konst && l.t.IsInt() {
-			lc = l.code + ".0"
+			lc = "float64(" + l.code + ")"
 		}
 		if !(r.t.IsFloat() && r.t.Name == "float64") && !r.konst {
 			rc = "float64(" + r.code + ")"

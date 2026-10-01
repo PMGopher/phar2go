@@ -660,11 +660,11 @@ func sortArray(a *Array, less func(x, y Entry) bool, keepKeys bool) bool {
 }
 
 const (
-	SORT_REGULAR       = 0
-	SORT_NUMERIC       = 1
-	SORT_STRING        = 2
-	SORT_NATURAL       = 6
-	SORT_FLAG_CASE     = 8
+	SORT_REGULAR   = 0
+	SORT_NUMERIC   = 1
+	SORT_STRING    = 2
+	SORT_NATURAL   = 6
+	SORT_FLAG_CASE = 8
 )
 
 func flagLess(flags []int) func(a, b any) bool {

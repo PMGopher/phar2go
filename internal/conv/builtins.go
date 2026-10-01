@@ -22,8 +22,8 @@ func phpxFuncName(name string) string {
 }
 
 var phpxRenames = map[string]string{
-	"pow":       "PowFn",
-	"is_null":   "IsNullV",
+	"pow":              "PowFn",
+	"is_null":          "IsNullV",
 	"array_key_exists": "ArrayKeyExists",
 }
 
@@ -183,9 +183,16 @@ func (f *fctx) funcCall(x *ast.ExprFunctionCall, want *api.Type) value {
 				return callv(f.phpx(fn)+"("+strings.Join(codes, ", ")+")", t)
 			}
 		}
-	case "is_a", "is_subclass_of":
-		f.anyArgs(x.Args)
-		return callv(f.todo(x, "%s() isn't supported; use instanceof", name)+"false", api.Bool)
+	case "class_exists", "interface_exists", "trait_exists", "enum_exists":
+		if len(args) >= 1 {
+			if name, ok := f.constClassName(args[0].expr); ok {
+				if f.cv.classes[strings.ToLower(name)] == nil && f.cv.extClassType(name) != nil {
+					f.cv.extKnown[strings.ToLower(name)] = true
+				}
+			}
+		}
+	case "function_exists":
+
 	case "preg_match", "preg_match_all":
 		if len(args) >= 3 {
 			p := arg(0, api.String)
@@ -242,4 +249,22 @@ func (f *fctx) callArgsRaw(args []phpArg) string {
 		}
 	}
 	return strings.Join(out, ", ")
+}
+
+// constClassName returns the class name of a string literal or Foo::class.
+func (f *fctx) constClassName(n ast.Vertex) (string, bool) {
+	switch x := n.(type) {
+	case *ast.ScalarString:
+		return strings.TrimPrefix(unquotePHP(x), "\\"), true
+	case *ast.ExprClassConstFetch:
+		if strings.EqualFold(identValue(x.Const), "class") {
+			if c, php, kind := f.staticClass(x.Class); kind != "dynamic" {
+				if c != nil {
+					return c.FQCN, true
+				}
+				return php, true
+			}
+		}
+	}
+	return "", false
 }

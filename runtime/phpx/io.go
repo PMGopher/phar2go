@@ -79,8 +79,8 @@ func fromJSON(v any) any {
 	return v
 }
 
-func JsonLastError() int        { return 0 }
-func JsonLastErrorMsg() string  { return "No error" }
+func JsonLastError() int       { return 0 }
+func JsonLastErrorMsg() string { return "No error" }
 
 // YamlParse is yaml_parse($yaml).
 func YamlParse(s string, _ ...any) any {
@@ -192,8 +192,8 @@ func Mkdir(p string, args ...any) bool {
 	return os.Mkdir(p, 0o755) == nil
 }
 
-func Rmdir(p string) bool  { return os.Remove(p) == nil }
-func Unlink(p string) bool { return os.Remove(p) == nil }
+func Rmdir(p string) bool     { return os.Remove(p) == nil }
+func Unlink(p string) bool    { return os.Remove(p) == nil }
 func Rename(a, b string) bool { return os.Rename(a, b) == nil }
 func Copy(a, b string) bool {
 	data, err := os.ReadFile(a)
@@ -335,8 +335,8 @@ func Hrtime(asNumber ...bool) any {
 	return List(int(n/1e9), int(n%1e9))
 }
 
-func Sleep(s int) int         { time.Sleep(time.Duration(s) * time.Second); return 0 }
-func Usleep(us int)           { time.Sleep(time.Duration(us) * time.Microsecond) }
+func Sleep(s int) int { time.Sleep(time.Duration(s) * time.Second); return 0 }
+func Usleep(us int)   { time.Sleep(time.Duration(us) * time.Microsecond) }
 
 // Date is date($format, $timestamp).
 func Date(format string, ts ...any) string {
@@ -542,20 +542,40 @@ func Getenv(name string, _ ...any) any {
 	return v
 }
 
-func PhpUname(_ ...string) string { return "Linux" }
-func PhpSapiName() string         { return "cli" }
-func Phpversion(_ ...string) string { return PHP_VERSION }
-func MemoryGetUsage(_ ...bool) int { return 0 }
+func PhpUname(_ ...string) string      { return "Linux" }
+func PhpSapiName() string              { return "cli" }
+func Phpversion(_ ...string) string    { return PHP_VERSION }
+func MemoryGetUsage(_ ...bool) int     { return 0 }
 func MemoryGetPeakUsage(_ ...bool) int { return 0 }
-func GcCollectCycles() int         { return 0 }
-func SetTimeLimit(_ int) bool      { return true }
-func IniSet(_ string, _ any) any   { return false }
-func IniGet(_ string) any          { return false }
-func ErrorReporting(_ ...int) int  { return E_ALL }
-func FunctionExists(_ string) bool { return false }
-func ExtensionLoaded(_ string) bool { return false }
-func ClassExists(_ string, _ ...bool) bool { return false }
-func InterfaceExists(_ string, _ ...bool) bool { return false }
+func GcCollectCycles() int             { return 0 }
+func SetTimeLimit(_ int) bool          { return true }
+func IniSet(_ string, _ any) any       { return false }
+func IniGet(_ string) any              { return false }
+func ErrorReporting(_ ...int) int      { return E_ALL }
+func FunctionExists(name string) bool  { return knownFunctions[strings.ToLower(name)] }
+func ExtensionLoaded(_ string) bool    { return false }
+func ClassExists(name string, _ ...bool) bool {
+	return knownClasses[strings.ToLower(strings.TrimPrefix(name, "\\"))]
+}
+func InterfaceExists(name string, _ ...bool) bool { return ClassExists(name) }
+func TraitExists(name string, _ ...bool) bool     { return ClassExists(name) }
+func EnumExists(name string, _ ...bool) bool      { return ClassExists(name) }
+
+var (
+	knownClasses   = map[string]bool{}
+	knownFunctions = map[string]bool{}
+)
+
+// RegisterClasses records the classes and functions of the converted plugin (and the server
+// classes it uses), for class_exists() and function_exists().
+func RegisterClasses(classes []string, functions []string) {
+	for _, c := range classes {
+		knownClasses[strings.ToLower(c)] = true
+	}
+	for _, f := range functions {
+		knownFunctions[strings.ToLower(f)] = true
+	}
+}
 func TriggerError(msg string, _ ...int) bool {
 	fmt.Fprintln(os.Stderr, msg)
 	return true
@@ -574,4 +594,79 @@ func Exit(v ...any) {
 		}
 	}
 	Throw(NewError("Error", msg))
+}
+
+var classParents = map[string][]string{}
+
+// RegisterParents records the parent classes and interfaces of the plugin's classes.
+func RegisterParents(parents map[string][]string) {
+	for c, ps := range parents {
+		l := make([]string, len(ps))
+		for i, p := range ps {
+			l[i] = strings.ToLower(p)
+		}
+		classParents[strings.ToLower(c)] = l
+	}
+}
+
+// IsA is is_a($objectOrClass, $class, $allowString).
+func IsA(v any, class string, allowString ...bool) bool {
+	name := ""
+	if s, ok := v.(string); ok {
+		if len(allowString) == 0 || !allowString[0] {
+			return false
+		}
+		name = s
+	} else {
+		name = ClassName(v)
+	}
+	return isA(name, class, true)
+}
+
+// IsSubclassOf is is_subclass_of($objectOrClass, $class).
+func IsSubclassOf(v any, class string, _ ...bool) bool {
+	name, ok := v.(string)
+	if !ok {
+		name = ClassName(v)
+	}
+	return isA(name, class, false)
+}
+
+func isA(name, class string, self bool) bool {
+	name = strings.ToLower(strings.TrimPrefix(name, "\\"))
+	class = strings.ToLower(strings.TrimPrefix(class, "\\"))
+	if name == class {
+		return self
+	}
+	for _, p := range classParents[name] {
+		if p == class {
+			return true
+		}
+	}
+	return false
+}
+
+// ClassImplements is class_implements($objectOrClass).
+func ClassImplements(v any, _ ...bool) *Array {
+	name, ok := v.(string)
+	if !ok {
+		name = ClassName(v)
+	}
+	out := NewArray()
+	for _, p := range classParents[strings.ToLower(name)] {
+		out.Set(p, p)
+	}
+	return out
+}
+
+// GetParentClass is get_parent_class($objectOrClass).
+func GetParentClass(v any) any {
+	name, ok := v.(string)
+	if !ok {
+		name = ClassName(v)
+	}
+	if ps := classParents[strings.ToLower(name)]; len(ps) > 0 {
+		return ps[0]
+	}
+	return false
 }

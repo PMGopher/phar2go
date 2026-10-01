@@ -342,9 +342,9 @@ func (f *fctx) switchStmt(x *ast.StmtSwitch) string {
 	defer func() { f.loops = f.loops[:len(f.loops)-1] }()
 
 	type group struct {
-		conds   []ast.Vertex
-		isDef   bool
-		stmts   []ast.Vertex
+		conds []ast.Vertex
+		isDef bool
+		stmts []ast.Vertex
 	}
 	var groups []*group
 	cur := &group{}
@@ -741,7 +741,7 @@ func (f *fctx) closure(params []ast.Vertex, uses []ast.Vertex, retNode ast.Verte
 	}
 	// Captured variables.
 	type capture struct {
-		name string
+		name  string
 		outer *local
 	}
 	var byVal []capture

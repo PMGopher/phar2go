@@ -2,17 +2,76 @@ package phpx
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/PMGopher/phar2go/runtime/phpx/regexp2"
 )
 
 var regexCache sync.Map
 
-// compilePCRE compiles a PHP (PCRE) pattern with delimiters and flags, like "/^a+$/i", to a Go
-// regular expression. Lookarounds and backreferences aren't supported by Go and throw.
-func compilePCRE(pattern string) *regexp.Regexp {
+// pcre is a compiled PHP regular expression: Go's regexp when it can handle the pattern,
+// otherwise regexp2 (lookarounds, backreferences, atomic groups, ...).
+type pcre interface {
+	// FindStringSubmatchIndex returns byte offsets of the match and its groups (-1 when a
+	// group didn't match), or nil.
+	FindStringSubmatchIndex(s string) []int
+	FindAllStringSubmatchIndex(s string, n int) [][]int
+	NumSubexp() int
+	SubexpNames() []string
+}
+
+type goRE struct{ *regexp.Regexp }
+
+type re2 struct {
+	re    *regexp2.Regexp
+	names []string
+}
+
+func (r *re2) NumSubexp() int        { return len(r.names) - 1 }
+func (r *re2) SubexpNames() []string { return r.names }
+
+func (r *re2) FindStringSubmatchIndex(s string) []int {
+	all := r.FindAllStringSubmatchIndex(s, 1)
+	if len(all) == 0 {
+		return nil
+	}
+	return all[0]
+}
+
+func (r *re2) FindAllStringSubmatchIndex(s string, n int) [][]int {
+	// regexp2 reports positions in runes.
+	offsets := make([]int, 0, len(s)+1)
+	for i := range s {
+		offsets = append(offsets, i)
+	}
+	offsets = append(offsets, len(s))
+	var out [][]int
+	m, err := r.re.FindStringMatch(s)
+	for err == nil && m != nil && (n < 0 || len(out) < n) {
+		loc := make([]int, 2*len(r.names))
+		for i := range loc {
+			loc[i] = -1
+		}
+		for _, g := range m.Groups() {
+			num := r.re.GroupNumberFromName(g.Name)
+			if num < 0 || num >= len(r.names) || len(g.Captures) == 0 {
+				continue
+			}
+			loc[2*num] = offsets[g.Index]
+			loc[2*num+1] = offsets[g.Index+g.Length]
+		}
+		out = append(out, loc)
+		m, err = r.re.FindNextMatch(m)
+	}
+	return out
+}
+
+// compilePCRE compiles a PHP (PCRE) pattern with delimiters and flags, like "/^a+$/i".
+func compilePCRE(pattern string) pcre {
 	if r, ok := regexCache.Load(pattern); ok {
-		return r.(*regexp.Regexp)
+		return r.(pcre)
 	}
 	p := strings.TrimLeft(pattern, " \t\n")
 	if p == "" {
@@ -36,10 +95,20 @@ func compilePCRE(pattern string) *regexp.Regexp {
 	}
 	body, mods := p[1:end], p[end+1:]
 	flags := ""
+	var opts regexp2.RegexOptions
 	for _, m := range mods {
 		switch m {
-		case 'i', 'm', 's', 'U':
-			flags += string(m)
+		case 'i':
+			flags += "i"
+			opts |= regexp2.IgnoreCase
+		case 'm':
+			flags += "m"
+			opts |= regexp2.Multiline
+		case 's':
+			flags += "s"
+			opts |= regexp2.Singleline
+		case 'U':
+			flags += "U"
 		case 'x':
 			body = stripExtended(body)
 		}
@@ -49,15 +118,85 @@ func compilePCRE(pattern string) *regexp.Regexp {
 	} else {
 		body = strings.ReplaceAll(body, `\/`, `/`)
 	}
+	goBody := body
 	if flags != "" {
-		body = "(?" + flags + ")" + body
+		goBody = "(?" + flags + ")" + body
 	}
-	re, err := regexp.Compile(body)
-	if err != nil {
-		Throw(NewError("ValueError", "preg: unsupported regular expression "+pattern+": "+err.Error()))
+	var compiled pcre
+	if re, err := regexp.Compile(goBody); err == nil {
+		compiled = goRE{re}
+	} else {
+		re, err2 := regexp2.Compile(body, opts)
+		if err2 != nil {
+			Throw(NewError("ValueError", "preg: unsupported regular expression "+pattern+": "+err2.Error()))
+		}
+		nums := re.GetGroupNumbers()
+		maxNum := 0
+		for _, n := range nums {
+			if n > maxNum {
+				maxNum = n
+			}
+		}
+		names := make([]string, maxNum+1)
+		for _, n := range nums {
+			if name := re.GroupNameFromNumber(n); name != strconv.Itoa(n) {
+				names[n] = name
+			}
+		}
+		compiled = &re2{re: re, names: names}
 	}
-	regexCache.Store(pattern, re)
-	return re
+	regexCache.Store(pattern, compiled)
+	return compiled
+}
+
+// expand builds a replacement for one match: $1, \1 and ${1} refer to groups.
+func expand(repl string, s string, loc []int) string {
+	var sb strings.Builder
+	for i := 0; i < len(repl); i++ {
+		c := repl[i]
+		if (c == '$' || c == '\\') && i+1 < len(repl) {
+			j := i + 1
+			brace := c == '$' && repl[j] == '{'
+			if brace {
+				j++
+			}
+			k := j
+			for k < len(repl) && k-j < 2 && repl[k] >= '0' && repl[k] <= '9' {
+				k++
+			}
+			if k > j {
+				g, _ := strconv.Atoi(repl[j:k])
+				if 2*g+1 < len(loc) && loc[2*g] >= 0 {
+					sb.WriteString(s[loc[2*g]:loc[2*g+1]])
+				}
+				if brace && k < len(repl) && repl[k] == '}' {
+					k++
+				}
+				i = k - 1
+				continue
+			}
+			if c == '\\' && repl[j] == '\\' {
+				sb.WriteByte('\\')
+				i++
+				continue
+			}
+		}
+		sb.WriteByte(c)
+	}
+	return sb.String()
+}
+
+// replaceAll replaces up to limit matches (-1: all) using fn.
+func replaceAll(re pcre, s string, limit int, fn func(loc []int) string) string {
+	var sb strings.Builder
+	last := 0
+	for _, loc := range re.FindAllStringSubmatchIndex(s, limit) {
+		sb.WriteString(s[last:loc[0]])
+		sb.WriteString(fn(loc))
+		last = loc[1]
+	}
+	sb.WriteString(s[last:])
+	return sb.String()
 }
 
 func stripExtended(s string) string {
@@ -88,7 +227,7 @@ func stripExtended(s string) string {
 	return sb.String()
 }
 
-func groupsArray(re *regexp.Regexp, s string, loc []int) *Array {
+func groupsArray(re pcre, s string, loc []int) *Array {
 	out := NewArray()
 	names := re.SubexpNames()
 	for i := 0; i*2 < len(loc); i++ {
@@ -158,39 +297,6 @@ func PregMatchAll(pattern string, subject string, args ...any) int {
 	return len(all)
 }
 
-// convertReplacement converts $1, \1 and ${1} references to Go's ${1}.
-func convertReplacement(r string) string {
-	var sb strings.Builder
-	for i := 0; i < len(r); i++ {
-		c := r[i]
-		if (c == '$' || c == '\\') && i+1 < len(r) {
-			j := i + 1
-			brace := c == '$' && r[j] == '{'
-			if brace {
-				j++
-			}
-			k := j
-			for k < len(r) && k-j < 2 && isDigit(r[k]) {
-				k++
-			}
-			if k > j {
-				sb.WriteString("${" + r[j:k] + "}")
-				if brace && k < len(r) && r[k] == '}' {
-					k++
-				}
-				i = k - 1
-				continue
-			}
-		}
-		if c == '$' {
-			sb.WriteString("$$")
-			continue
-		}
-		sb.WriteByte(c)
-	}
-	return sb.String()
-}
-
 // PregReplace is preg_replace($pattern, $replacement, $subject, $limit).
 func PregReplace(pattern any, replacement any, subject any, limit ...int) any {
 	do := func(s string) string {
@@ -204,19 +310,13 @@ func PregReplace(pattern any, replacement any, subject any, limit ...int) any {
 				r = Index(ra.Values(), i)
 			}
 			re := compilePCRE(ToString(p))
-			repl := convertReplacement(ToString(r))
+			repl := ToString(r)
+			n := -1
 			if len(limit) > 0 && limit[0] >= 0 {
-				n := limit[0]
-				s = re.ReplaceAllStringFunc(s, func(m string) string {
-					if n == 0 {
-						return m
-					}
-					n--
-					return re.ReplaceAllString(m, repl)
-				})
-				continue
+				n = limit[0]
 			}
-			s = re.ReplaceAllString(s, repl)
+			subject := s
+			s = replaceAll(re, subject, n, func(loc []int) string { return expand(repl, subject, loc) })
 		}
 		return s
 	}
@@ -234,15 +334,7 @@ func PregReplace(pattern any, replacement any, subject any, limit ...int) any {
 func PregReplaceCallback(pattern any, callback any, subject any, _ ...any) any {
 	re := compilePCRE(ToString(pattern))
 	s := ToString(subject)
-	var sb strings.Builder
-	last := 0
-	for _, loc := range re.FindAllStringSubmatchIndex(s, -1) {
-		sb.WriteString(s[last:loc[0]])
-		sb.WriteString(ToString(Invoke(callback, groupsArray(re, s, loc))))
-		last = loc[1]
-	}
-	sb.WriteString(s[last:])
-	return sb.String()
+	return replaceAll(re, s, -1, func(loc []int) string { return ToString(Invoke(callback, groupsArray(re, s, loc))) })
 }
 
 // PregSplit is preg_split($pattern, $subject, $limit, $flags).
@@ -254,12 +346,24 @@ func PregSplit(pattern string, subject string, args ...int) *Array {
 	}
 	noEmpty := len(args) > 1 && args[1]&PREG_SPLIT_NO_EMPTY != 0
 	out := NewArray()
-	for _, p := range re.Split(subject, limit) {
-		if noEmpty && p == "" {
+	last := 0
+	n := -1
+	if limit > 0 {
+		n = limit - 1
+	}
+	add := func(p string) {
+		if !(noEmpty && p == "") {
+			out.Append(p)
+		}
+	}
+	for _, loc := range re.FindAllStringSubmatchIndex(subject, n) {
+		if loc[1] == 0 && loc[0] == 0 {
 			continue
 		}
-		out.Append(p)
+		add(subject[last:loc[0]])
+		last = loc[1]
 	}
+	add(subject[last:])
 	return out
 }
 
@@ -278,7 +382,7 @@ func PregGrep(pattern string, a any) *Array {
 	re := compilePCRE(pattern)
 	out := NewArray()
 	for _, e := range Iter(a) {
-		if re.MatchString(ToString(e.Val)) {
+		if re.FindStringSubmatchIndex(ToString(e.Val)) != nil {
 			out.Set(e.Key, e.Val)
 		}
 	}

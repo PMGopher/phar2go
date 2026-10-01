@@ -12,18 +12,19 @@ import (
 	"hash/crc32"
 	"html"
 	"math/rand/v2"
+	"net"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 )
 
-func Strlen(s string) int                { return len(s) }
-func Strtolower(s string) string         { return strings.ToLower(s) }
-func Strtoupper(s string) string         { return strings.ToUpper(s) }
+func Strlen(s string) int                    { return len(s) }
+func Strtolower(s string) string             { return strings.ToLower(s) }
+func Strtoupper(s string) string             { return strings.ToUpper(s) }
 func MbStrtolower(s string, _ ...any) string { return strings.ToLower(s) }
 func MbStrtoupper(s string, _ ...any) string { return strings.ToUpper(s) }
-func MbStrlen(s string, _ ...any) int    { return utf8.RuneCountInString(s) }
+func MbStrlen(s string, _ ...any) int        { return utf8.RuneCountInString(s) }
 func Strrev(s string) string {
 	b := []byte(s)
 	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
@@ -461,8 +462,8 @@ func Strncmp(a, b string, n int) int {
 	return strings.Compare(a, b)
 }
 func Strncasecmp(a, b string, n int) int { return Strncmp(strings.ToLower(a), strings.ToLower(b), n) }
-func Strnatcmp(a, b string) int        { return natCompare(a, b, false) }
-func Strnatcasecmp(a, b string) int    { return natCompare(a, b, true) }
+func Strnatcmp(a, b string) int          { return natCompare(a, b, false) }
+func Strnatcasecmp(a, b string) int      { return natCompare(a, b, true) }
 
 func natCompare(a, b string, fold bool) int {
 	if fold {
@@ -547,12 +548,15 @@ func Ord(s string) int {
 
 func Chr(n int) string { return string([]byte{byte(((n % 256) + 256) % 256)}) }
 
-func Dechex(n int) string  { return strconv.FormatUint(uint64(n), 16) }
-func Decbin(n int) string  { return strconv.FormatUint(uint64(n), 2) }
-func Decoct(n int) string  { return strconv.FormatUint(uint64(n), 8) }
-func Hexdec(s string) int  { n, _ := strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 64); return int(n) }
-func Bindec(s string) int  { n, _ := strconv.ParseUint(s, 2, 64); return int(n) }
-func Octdec(s string) int  { n, _ := strconv.ParseUint(s, 8, 64); return int(n) }
+func Dechex(n int) string { return strconv.FormatUint(uint64(n), 16) }
+func Decbin(n int) string { return strconv.FormatUint(uint64(n), 2) }
+func Decoct(n int) string { return strconv.FormatUint(uint64(n), 8) }
+func Hexdec(s string) int {
+	n, _ := strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 64)
+	return int(n)
+}
+func Bindec(s string) int     { n, _ := strconv.ParseUint(s, 2, 64); return int(n) }
+func Octdec(s string) int     { n, _ := strconv.ParseUint(s, 8, 64); return int(n) }
 func Bin2hex(s string) string { return hex.EncodeToString([]byte(s)) }
 func Hex2bin(s string) any {
 	b, err := hex.DecodeString(s)
@@ -585,7 +589,7 @@ func hashHex(h hash.Hash, s string, raw []bool) string {
 
 func Md5(s string, raw ...bool) string  { return hashHex(md5.New(), s, raw) }
 func Sha1(s string, raw ...bool) string { return hashHex(sha1.New(), s, raw) }
-func Crc32(s string) int              { return int(crc32.ChecksumIEEE([]byte(s))) }
+func Crc32(s string) int                { return int(crc32.ChecksumIEEE([]byte(s))) }
 
 // Hash is hash($algo, $data).
 func Hash(algo string, data string, raw ...bool) string {
@@ -607,7 +611,7 @@ func Hash(algo string, data string, raw ...bool) string {
 	return ""
 }
 
-func Htmlspecialchars(s string, _ ...any) string { return html.EscapeString(s) }
+func Htmlspecialchars(s string, _ ...any) string       { return html.EscapeString(s) }
 func HtmlspecialcharsDecode(s string, _ ...any) string { return html.UnescapeString(s) }
 func Addslashes(s string) string {
 	r := strings.NewReplacer(`\`, `\\`, `'`, `\'`, `"`, `\"`, "\x00", `\0`)
@@ -744,7 +748,7 @@ func Intval(v any, base ...int) int {
 	}
 	return ToInt(v)
 }
-func Floatval(v any) float64 { return ToFloat(v) }
+func Floatval(v any) float64  { return ToFloat(v) }
 func Doubleval(v any) float64 { return ToFloat(v) }
 func Strval(v any) string     { return ToString(v) }
 func Boolval(v any) bool      { return ToBool(v) }
@@ -788,4 +792,180 @@ func Gettype(v any) string {
 	return "object"
 }
 func GetDebugType(v any) string { return TypeName(v) }
-func GetClass(v any) string      { return ClassName(v) }
+func GetClass(v any) string     { return ClassName(v) }
+
+// FilterVar is filter_var() for the validation filters.
+func FilterVar(v any, filter ...int) any {
+	f := FILTER_DEFAULT
+	if len(filter) > 0 {
+		f = filter[0]
+	}
+	s := strings.TrimSpace(ToString(v))
+	switch f {
+	case FILTER_VALIDATE_INT:
+		if n, err := strconv.Atoi(s); err == nil {
+			return n
+		}
+		return false
+	case FILTER_VALIDATE_FLOAT:
+		if n, err := strconv.ParseFloat(s, 64); err == nil {
+			return n
+		}
+		return false
+	case FILTER_VALIDATE_BOOL:
+		switch strings.ToLower(s) {
+		case "1", "true", "on", "yes":
+			return true
+		case "0", "false", "off", "no", "":
+			return false
+		}
+		return nil
+	case FILTER_VALIDATE_EMAIL:
+		if i := strings.IndexByte(s, '@'); i > 0 && strings.Contains(s[i:], ".") {
+			return s
+		}
+		return false
+	case FILTER_VALIDATE_URL:
+		if strings.Contains(s, "://") {
+			return s
+		}
+		return false
+	case FILTER_VALIDATE_IP:
+		if net.ParseIP(s) != nil {
+			return s
+		}
+		return false
+	}
+	return ToString(v)
+}
+
+// VersionCompare is version_compare($a, $b, $operator).
+func VersionCompare(a, b string, op ...string) any {
+	c := cmpVersions(a, b)
+	if len(op) == 0 {
+		return c
+	}
+	switch op[0] {
+	case "<", "lt":
+		return c < 0
+	case "<=", "le":
+		return c <= 0
+	case ">", "gt":
+		return c > 0
+	case ">=", "ge":
+		return c >= 0
+	case "==", "eq":
+		return c == 0
+	case "!=", "<>", "ne":
+		return c != 0
+	}
+	return nil
+}
+
+func cmpVersions(a, b string) int {
+	norm := func(s string) []string {
+		s = strings.NewReplacer("-", ".", "_", ".", "+", ".").Replace(s)
+		return strings.Split(s, ".")
+	}
+	pa, pb := norm(a), norm(b)
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		var x, y string
+		if i < len(pa) {
+			x = pa[i]
+		}
+		if i < len(pb) {
+			y = pb[i]
+		}
+		nx, ex := strconv.Atoi(x)
+		ny, ey := strconv.Atoi(y)
+		switch {
+		case ex == nil && ey == nil:
+			if nx != ny {
+				return sign(nx - ny)
+			}
+		case x == "":
+			return -1
+		case y == "":
+			return 1
+		default:
+			if c := strings.Compare(x, y); c != 0 {
+				return c
+			}
+		}
+	}
+	return 0
+}
+
+// MbConvertCase is mb_convert_case().
+func MbConvertCase(s string, mode int, _ ...any) string {
+	switch mode {
+	case MB_CASE_UPPER:
+		return strings.ToUpper(s)
+	case MB_CASE_LOWER:
+		return strings.ToLower(s)
+	}
+	return Ucwords(strings.ToLower(s))
+}
+
+func MbStrwidth(s string, _ ...any) int { return utf8.RuneCountInString(s) }
+func MbStrrev(s string) string {
+	r := []rune(s)
+	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
+		r[i], r[j] = r[j], r[i]
+	}
+	return string(r)
+}
+func Lcg() float64                { return rand.Float64() }
+func Assert(v any, _ ...any) bool { return true }
+func Utf8Encode(s string) string  { return s }
+func Utf8Decode(s string) string  { return s }
+func Quotemeta(s string) string   { return regexpQuote(s) }
+func regexpQuote(s string) string {
+	return strings.NewReplacer(`.`, `\.`, `\`, `\\`, `+`, `\+`, `*`, `\*`, `?`, `\?`, `[`, `\[`, `^`, `\^`, `]`, `\]`, `$`, `\$`, `(`, `\(`, `)`, `\)`).Replace(s)
+}
+func SimilarText(a, b string, _ ...any) int { return similarText(a, b) }
+func similarText(a, b string) int {
+	if a == "" || b == "" {
+		return 0
+	}
+	maxLen, pa, pb := 0, 0, 0
+	for i := 0; i < len(a); i++ {
+		for j := 0; j < len(b); j++ {
+			k := 0
+			for i+k < len(a) && j+k < len(b) && a[i+k] == b[j+k] {
+				k++
+			}
+			if k > maxLen {
+				maxLen, pa, pb = k, i, j
+			}
+		}
+	}
+	if maxLen == 0 {
+		return 0
+	}
+	return maxLen + similarText(a[:pa], b[:pb]) + similarText(a[pa+maxLen:], b[pb+maxLen:])
+}
+func Levenshtein(a, b string, _ ...int) int {
+	d := make([]int, len(b)+1)
+	for j := range d {
+		d[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		prev := d[0]
+		d[0] = i
+		for j := 1; j <= len(b); j++ {
+			tmp := d[j]
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			d[j] = min(d[j]+1, d[j-1]+1, prev+cost)
+			prev = tmp
+		}
+	}
+	return d[len(b)]
+}
+func Soundex(s string) string              { return s }
+func Metaphone(s string, _ ...int) string  { return s }
+func Fwrite(_ any, s string, _ ...int) any { Echo(s); return len(s) }
+func Fputs(h any, s string, _ ...int) any  { return Fwrite(h, s) }

@@ -45,7 +45,7 @@ func (cv *converter) emitAll(res *Result) {
 	files := map[string]*goFile{}
 	var order []string
 	fileFor := func(p string) *goFile {
-		name := goFileName(p)
+		name := cv.goFileName(p)
 		if gf, ok := files[name]; ok {
 			return gf
 		}
@@ -65,10 +65,15 @@ func (cv *converter) emitAll(res *Result) {
 		gf := fileFor(cv.funcFile[fn].Path)
 		gf.parts = append(gf.parts, cv.emitFunc(gf, fn))
 	}
-	if len(cv.staticVars) > 0 || len(cv.defines) > 0 {
-		gf := fileFor("static_vars.php")
+	{
+		gf := fileFor("phar2go_runtime.php")
 		var lines []string
 		for _, s := range cv.staticVars {
+			if strings.Contains(s, "Unsupported(") {
+				// Never panic while the server starts.
+				name := strings.Fields(s)[1]
+				s = "var " + name + " any // TODO(phar2go): " + strings.TrimPrefix(s, "var "+name+" = ")
+			}
 			lines = append(lines, s)
 		}
 		var defs []string
@@ -84,7 +89,69 @@ func (cv *converter) emitAll(res *Result) {
 				gf.imports.paths[p] = true
 			}
 		}
-		gf.parts = append(gf.parts, "// Variables of PHP `static` declarations and define()d constants.\n"+strings.Join(lines, "\n"))
+		var classes, funcs []string
+		for _, c := range cv.classList {
+			if !strings.HasPrefix(c.File.Path, "phar2go-stubs/") {
+				classes = append(classes, quote(c.FQCN))
+			}
+		}
+		for k := range cv.extKnown {
+			classes = append(classes, quote(k))
+		}
+		sort.Strings(classes)
+		for _, fn := range sortedFuncs(cv.funcs) {
+			funcs = append(funcs, quote(fn.Name))
+		}
+		f := cv.newFctx(gf, nil, nil)
+		// Parents and interfaces, for is_a() and is_subclass_of().
+		var parents []string
+		for _, c := range cv.classList {
+			if c.Kind == kindTrait || strings.HasPrefix(c.File.Path, "phar2go-stubs/") {
+				continue
+			}
+			var ps []string
+			seen := map[*class]bool{}
+			var walkC func(k *class)
+			walkC = func(k *class) {
+				if k == nil || seen[k] {
+					return
+				}
+				seen[k] = true
+				if k != c {
+					ps = append(ps, quote(k.FQCN))
+				}
+				if k.ExtParentPH != "" {
+					ps = append(ps, quote(k.ExtParentPH))
+					for _, a := range cv.extAncestors(k.ExtParent) {
+						ps = append(ps, quote(a))
+					}
+				}
+				for _, i := range k.IfaceNames {
+					if cv.classes[strings.ToLower(i)] == nil {
+						ps = append(ps, quote(i))
+					}
+				}
+				for _, i := range k.Ifaces {
+					walkC(i)
+				}
+				walkC(k.Parent)
+			}
+			walkC(c)
+			if len(ps) > 0 {
+				parents = append(parents, quote(c.FQCN)+": {"+strings.Join(ps, ", ")+"},")
+			}
+		}
+		reg := fmt.Sprintf("// The plugin's classes, for class_exists(), is_a() and is_subclass_of().\nfunc init() {\n%s([]string{\n%s,\n}, []string{%s})\n%s(map[string][]string{\n%s\n})\n}",
+			f.phpx("RegisterClasses"), strings.Join(classes, ",\n"), strings.Join(funcs, ", "), f.phpx("RegisterParents"), strings.Join(parents, "\n"))
+		if cv.usesServer {
+			srv := f.pkgRef(cv.idx.Module+"/pocketmine/server") + ".Server"
+			pl := "*" + cv.mainType
+			reg += fmt.Sprintf("\n\n// PluginInstance is the plugin, set when the server creates it (see plugin.go).\nvar PluginInstance %s\n\n// phar2goServer is Server::getInstance(): the server that loaded the plugin.\nfunc phar2goServer() *%s {\nreturn PluginInstance.GetServer().(*%s)\n}", pl, srv, srv)
+		}
+		if len(lines) > 0 {
+			gf.parts = append(gf.parts, "// Variables of PHP `static` declarations and define()d constants.\n"+strings.Join(lines, "\n"))
+		}
+		gf.parts = append(gf.parts, reg)
 	}
 	for _, name := range order {
 		gf := files[name]
@@ -361,6 +428,10 @@ func (cv *converter) emitClass(gf *goFile, c *class) string {
 		}
 		sb.WriteString(cv.emitMethod(gf, c, m))
 	}
+	for _, ad := range c.adapters {
+		sb.WriteString(cv.emitAdapter(gf, c, ad))
+	}
+	sb.WriteString(fmt.Sprintf("// PhpClass is the PHP class name (get_class()).\nfunc (%s *%s) PhpClass() string { return %s }\n\n", c.Recv, c.GoName, quote(c.FQCN)))
 	if cv.implementsJSON(c) {
 		sb.WriteString(fmt.Sprintf("// MarshalJSON encodes the value jsonSerialize() returns.\nfunc (%s *%s) MarshalJSON() ([]byte, error) {\nreturn %s(%s(%s.JsonSerialize()))\n}\n\n",
 			c.Recv, c.GoName, pf.pkgRef("encoding/json")+".Marshal", pf.phpx("JSONValue"), c.Recv))
@@ -584,6 +655,16 @@ func (cv *converter) emitBody(gf *goFile, f *fctx, m *method, header, doc string
 		}
 		variadic := sig.Variadic && i == len(sig.Params)-1
 		phpT := p.Type
+		if m.Adopted && i >= len(sig.Params) {
+			// A PHP parameter the server's method doesn't have: it gets its default value.
+			lv.t = p.Type
+			init := f.zero(p.Type)
+			if p.Default != nil {
+				init = f.coerce(f.expr(p.Default, p.Type), p.Type)
+			}
+			prologue = append(prologue, "var "+lv.goName+" "+f.typeStr(p.Type)+" = "+init, "_ = "+lv.goName)
+			continue
+		}
 		if m.Adopted {
 			// The Go type comes from the server; PHP code sees the PHP type.
 			if variadic {
@@ -757,4 +838,74 @@ func (cv *converter) emitEnum(gf *goFile, c *class) string {
 		sb.WriteString(cv.emitMethod(gf, c, m))
 	}
 	return sb.String()
+}
+
+// emitAdapter writes a method that implements an interface method through another method.
+func (cv *converter) emitAdapter(gf *goFile, c *class, ad *adapter) string {
+	f := cv.newFctx(gf, c, nil)
+	var params, args []string
+	for i, pt := range ad.Sig.Params {
+		name := "a" + itoa(i)
+		params = append(params, name+" "+f.paramTypeStr(pt, ad.Sig.Variadic && i == len(ad.Sig.Params)-1))
+		args = append(args, name)
+	}
+	header := fmt.Sprintf("func (%s *%s) %s(%s)%s {\n", c.Recv, c.GoName, ad.GoName, strings.Join(params, ", "), resultsStr(f, ad.Sig.Results))
+	if ad.Target == "" {
+		body := f.phpx("Throw") + "(" + f.phpx("NewError") + "(\"Error\", " + quote("method "+c.Short+"::"+ad.PHPName+"() isn't implemented") + "))"
+		if len(ad.Sig.Results) > 0 {
+			var zs []string
+			for _, r := range ad.Sig.Results {
+				zs = append(zs, f.zero(r))
+			}
+			body += "\nreturn " + strings.Join(zs, ", ")
+		}
+		cv.todos++
+		cv.warnf(c.File.Path, "%s::%s() is required by an interface but has no implementation", c.FQCN, ad.PHPName)
+		return fmt.Sprintf("// %s is required by an interface. TODO(phar2go): implement it.\n%s%s\n}\n\n", ad.GoName, header, body)
+	}
+	ts := ad.TargetSig
+	var cargs []string
+	for i, pt := range ts.Params {
+		if i < len(args) {
+			cargs = append(cargs, f.coerce(value{code: args[i], t: ad.Sig.Params[i], prec: 7}, pt))
+		} else {
+			cargs = append(cargs, f.zero(pt))
+		}
+	}
+	call := c.Recv + "." + ad.Target + "(" + strings.Join(cargs, ", ") + ")"
+	var body string
+	switch {
+	case len(ad.Sig.Results) == 0:
+		body = call
+	case len(ts.Results) == 0:
+		body = call + "\nreturn " + f.zero(ad.Sig.Results[0])
+	default:
+		body = "return " + f.coerce(value{code: call, t: ts.Results[0], prec: 7, call: true}, ad.Sig.Results[0])
+	}
+	return fmt.Sprintf("// %s implements %s() with %s.\n%s%s\n}\n\n", ad.GoName, ad.PHPName, ad.Target, header, body)
+}
+
+// extAncestors returns the PHP names of the classes a server type extends (through embedding).
+func (cv *converter) extAncestors(t *api.Type) []string {
+	var out []string
+	seen := map[string]bool{}
+	var walkT func(t *api.Type)
+	walkT = func(t *api.Type) {
+		if t == nil {
+			return
+		}
+		ti := cv.typeInfo(t.Deref())
+		if ti == nil || seen[t.Deref().Name] {
+			return
+		}
+		seen[t.Deref().Name] = true
+		for _, e := range ti.Embedded {
+			if ei := cv.typeInfo(e.Deref()); ei != nil && ei.PHP != "" {
+				out = append(out, ei.PHP)
+			}
+			walkT(e)
+		}
+	}
+	walkT(t)
+	return out
 }

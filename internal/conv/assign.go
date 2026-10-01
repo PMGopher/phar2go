@@ -109,6 +109,11 @@ func (f *fctx) storeCode(v value, t *api.Type) string {
 
 func (f *fctx) assignProp(objN, propN ast.Vertex, v value) string {
 	name := identValue(propN)
+	if varName(objN) == "this" && f.cls != nil && !f.static {
+		if p := f.cls.findProp(name); p != nil && !p.Static && p.Base != nil {
+			return f.recv + "." + p.GoName + " = " + f.storeCode(v, p.Base.Type)
+		}
+	}
 	cur := f.propFetch(objN, propN, false)
 	if name != "" && cur.lvalue && !strings.Contains(cur.code, f.pkgRef(api.PhpxPath)+".Prop(") {
 		return cur.code + " = " + f.storeCode(v, cur.t)

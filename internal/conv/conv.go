@@ -41,19 +41,21 @@ type Result struct {
 	External []string
 	// MainType is the Go type of the plugin's main class.
 	MainType string
+	// UsesServer is set when the code needs the plugin instance for Server::getInstance().
+	UsesServer bool
 }
 
 type converter struct {
 	idx  *api.Index
 	opts Options
 
-	files     []*phpFile
-	classes   map[string]*class
-	classList []*class
-	byGoType  map[string]*class
-	funcs     map[string]*function
-	funcFile  map[*function]*phpFile
-	anonCount int
+	files      []*phpFile
+	classes    map[string]*class
+	classList  []*class
+	byGoType   map[string]*class
+	funcs      map[string]*function
+	funcFile   map[*function]*phpFile
+	anonCount  int
 	anonByNode map[ast.Vertex]*class
 
 	external     map[string]bool
@@ -68,6 +70,11 @@ type converter struct {
 	localMethods  map[string]map[string]*api.Func
 	pkgNames      map[string]bool
 	defines       map[string]string // define()d constants -> Go name
+	extKnown      map[string]bool   // server classes checked with class_exists()
+	usesServer    bool
+	mainType      string
+	// srcRoot is the folder of the main class: file names are relative to it.
+	srcRoot string
 
 	// staticVars are package-level variables for `static $x` in functions.
 	staticVars    []string
@@ -81,10 +88,10 @@ func Convert(idx *api.Index, files map[string][]byte, opts Options) (*Result, er
 		classes: map[string]*class{}, byGoType: map[string]*class{},
 		funcs: map[string]*function{}, funcFile: map[*function]*phpFile{},
 		anonByNode: map[ast.Vertex]*class{},
-		external: map[string]bool{}, warnSeen: map[string]bool{},
+		external:   map[string]bool{}, warnSeen: map[string]bool{},
 		extCache: map[string]*api.Type{}, concreteCache: map[string]concreteResult{},
 		uses: map[*phpFile]map[string]string{}, localMethods: map[string]map[string]*api.Func{},
-		pkgNames: map[string]bool{}, defines: map[string]string{},
+		pkgNames: map[string]bool{}, defines: map[string]string{}, extKnown: map[string]bool{},
 	}
 	var paths []string
 	for p := range files {
@@ -119,12 +126,17 @@ func Convert(idx *api.Index, files map[string][]byte, opts Options) (*Result, er
 	res := &Result{Files: map[string][]byte{}}
 	if mc := cv.classes[strings.ToLower(opts.MainClass)]; mc != nil {
 		res.MainType = mc.GoName
+		cv.mainType = mc.GoName
+		if i := strings.LastIndexByte(mc.File.Path, '/'); i >= 0 {
+			cv.srcRoot = mc.File.Path[:i+1]
+		}
 		if mc.Abstract || mc.Kind != kindClass {
 			return nil, fmt.Errorf("the main class %s can't be instantiated", opts.MainClass)
 		}
 	}
 	cv.emitAll(res)
 	res.Warnings = cv.warnings
+	res.UsesServer = cv.usesServer
 	res.TODOs = cv.todos
 	for _, c := range cv.classList {
 		if c.Kind != kindTrait {
@@ -233,6 +245,7 @@ func (cv *converter) prepare() {
 	cv.pkgNames["init"] = true
 	cv.pkgNames["main"] = true
 	cv.pkgNames["files"] = true
+	cv.pkgNames["PluginInstance"] = true
 	// Class names: short names, qualified with namespace parts on collisions.
 	shortCount := map[string]int{}
 	for _, c := range cv.classList {
@@ -334,6 +347,11 @@ func (cv *converter) nameMembers(c *class) {
 		if c.Parent != nil {
 			if pp := c.Parent.findProp(p.Name); pp != nil && !pp.Static {
 				p.GoName = pp.GoName
+				p.Base = pp
+				for pp.Base != nil {
+					pp = pp.Base
+				}
+				p.Base = pp
 				continue
 			}
 		}
@@ -820,6 +838,47 @@ func (cv *converter) buildMethodSet(c *class) {
 	if c.Kind == kindEnum {
 		ms["Name"] = &api.Func{Results: []*api.Type{api.String}}
 	}
+	// Methods of the plugin's interfaces that the class gets under another Go name from the
+	// server type it extends (getAliases -> Aliases), or that nothing implements.
+	if !c.Abstract || c.Poly {
+		seen := map[string]bool{}
+		var visit func(k *class)
+		visit = func(k *class) {
+			for _, i := range k.Ifaces {
+				var walkI func(i *class)
+				walkI = func(i *class) {
+					if seen["i:"+i.GoName] {
+						return
+					}
+					seen["i:"+i.GoName] = true
+					for _, m := range i.Methods {
+						if m.Static || m.Sig == nil {
+							continue
+						}
+						if have, ok := ms[m.GoName]; ok && api.SameSig(have, m.Sig) {
+							continue
+						}
+						if _, ok := ms[m.GoName]; ok {
+							continue
+						}
+						ad := &adapter{GoName: m.GoName, Sig: m.Sig, PHPName: m.Name}
+						if t := findMethodName(ms, m.Name); t != "" {
+							ad.Target, ad.TargetSig = t, ms[t]
+						}
+						c.adapters = append(c.adapters, ad)
+						ms[m.GoName] = m.Sig
+					}
+					for _, sup := range i.Ifaces {
+						walkI(sup)
+					}
+				}
+				walkI(i)
+			}
+		}
+		for _, k := range c.ancestors() {
+			visit(k)
+		}
+	}
 	marshal := &api.Func{Results: []*api.Type{api.SliceOf(api.Basic("uint8")), api.Error}}
 	if c.findMethodIfaces("jsonSerialize") != nil {
 		ms["MarshalJSON"] = marshal
@@ -887,14 +946,35 @@ func (cv *converter) isImportName(n string) bool {
 	return n == "phpx"
 }
 
-// goFileName is the Go file a PHP file's code goes into.
-func goFileName(p string) string {
-	base := path.Base(p)
-	base = strings.TrimSuffix(base, path.Ext(base))
+// goFileName is the Go file a PHP file's code goes into: its path below the plugin's source
+// root, in snake case ("entity/ai/FloatGoal.php" -> "entity_ai_float_goal.go").
+func (cv *converter) goFileName(p string) string {
+	rel := p
+	if cv.srcRoot != "" && strings.HasPrefix(p, cv.srcRoot) {
+		rel = strings.TrimPrefix(p, cv.srcRoot)
+	} else {
+		rel = strings.TrimPrefix(rel, "src/")
+	}
+	rel = strings.TrimSuffix(rel, path.Ext(rel))
+	var parts []string
+	for _, seg := range strings.Split(rel, "/") {
+		if seg != "" {
+			parts = append(parts, snake(seg))
+		}
+	}
+	name := strings.Join(parts, "_")
+	if strings.HasSuffix(name, "_test") {
+		name += "_"
+	}
+	return name + ".go"
+}
+
+// snake converts a PHP file or folder name to snake case.
+func snake(base string) string {
 	var sb strings.Builder
 	for i, r := range base {
 		if r >= 'A' && r <= 'Z' {
-			if i > 0 && !(base[i-1] >= 'A' && base[i-1] <= 'Z') {
+			if i > 0 && !(base[i-1] >= 'A' && base[i-1] <= 'Z') && base[i-1] != '_' && base[i-1] != '-' {
 				sb.WriteByte('_')
 			}
 			sb.WriteRune(r + 32)
@@ -906,11 +986,7 @@ func goFileName(p string) string {
 		}
 		sb.WriteRune(r)
 	}
-	name := sb.String()
-	if strings.HasSuffix(name, "_test") {
-		name += "_"
-	}
-	return name + ".go"
+	return sb.String()
 }
 
 // hiddenTypes reports whether a signature uses unexported types of another package, which a
