@@ -471,6 +471,10 @@ func convertTo(v any, t reflect.Type) (reflect.Value, bool) {
 		if t == arrayType {
 			return reflect.ValueOf(ToArray(v)), true
 		}
+		// A plugin object where the server type it extends is wanted: the embedded value.
+		if e := embeddedPtr(rv, t); e.IsValid() {
+			return e, true
+		}
 		// A value where a pointer to it is wanted.
 		if rv.Type() == t.Elem() {
 			p := reflect.New(t.Elem())
@@ -523,6 +527,11 @@ func convertTo(v any, t reflect.Type) (reflect.Value, bool) {
 	case reflect.Func:
 		if rv.Kind() == reflect.Func {
 			return adaptFunc(rv, t), true
+		}
+		if name, ok := v.(string); ok {
+			if target, ok := stringCallable(name); ok {
+				return adaptFunc(reflect.ValueOf(target), t), true
+			}
 		}
 		if a, ok := v.(*Array); ok && a.Len() == 2 {
 			// [$object, "method"]
@@ -852,4 +861,38 @@ func CloneObject[T any](v T) T {
 		return cp.Interface().(T)
 	}
 	return v
+}
+
+// embeddedPtr finds a struct of type *t.Elem() embedded (at any depth) in the struct rv points
+// to, and returns a pointer to it.
+func embeddedPtr(rv reflect.Value, t reflect.Type) reflect.Value {
+	if rv.Kind() != reflect.Pointer || rv.IsNil() || rv.Elem().Kind() != reflect.Struct || t.Elem().Kind() != reflect.Struct {
+		return reflect.Value{}
+	}
+	queue := []reflect.Value{rv.Elem()}
+	for depth := 0; len(queue) > 0 && depth < 12; depth++ {
+		var next []reflect.Value
+		for _, sv := range queue {
+			st := sv.Type()
+			for i := 0; i < st.NumField(); i++ {
+				f := st.Field(i)
+				if !f.Anonymous {
+					continue
+				}
+				fv := sv.Field(i)
+				switch {
+				case f.Type == t.Elem():
+					return fv.Addr()
+				case f.Type == t && !fv.IsNil():
+					return fv
+				case f.Type.Kind() == reflect.Struct:
+					next = append(next, fv)
+				case f.Type.Kind() == reflect.Pointer && f.Type.Elem().Kind() == reflect.Struct && !fv.IsNil():
+					next = append(next, fv.Elem())
+				}
+			}
+		}
+		queue = next
+	}
+	return reflect.Value{}
 }

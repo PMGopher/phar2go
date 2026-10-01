@@ -103,6 +103,10 @@ func (cv *converter) emitAll(res *Result) {
 			funcs = append(funcs, quote(fn.Name))
 		}
 		f := cv.newFctx(gf, nil, nil)
+		var funcRegs []string
+		for _, fn := range sortedFuncs(cv.funcs) {
+			funcRegs = append(funcRegs, fmt.Sprintf("%s(%s, %s)", f.phpx("RegisterFunction"), quote(fn.Name), fn.GoName))
+		}
 		// Parents and interfaces, for is_a() and is_subclass_of().
 		var parents []string
 		for _, c := range cv.classList {
@@ -145,11 +149,11 @@ func (cv *converter) emitAll(res *Result) {
 		// $class::CONST.
 		var statics []string
 		for _, c := range cv.classList {
-			if c.Kind == kindTrait || c.Kind == kindInterface || strings.HasPrefix(c.File.Path, "phar2go-stubs/") {
+			if c.Kind == kindTrait || strings.HasPrefix(c.File.Path, "phar2go-stubs/") {
 				continue
 			}
 			for _, m := range c.Methods {
-				if m.Static && m.HasBody {
+				if m.Static && m.HasBody && c.Kind != kindInterface {
 					statics = append(statics, fmt.Sprintf("%s(%s, %s, %s)", f.phpx("RegisterStatic"), quote(c.FQCN), quote(m.Name), m.GoName))
 				}
 			}
@@ -164,6 +168,7 @@ func (cv *converter) emitAll(res *Result) {
 		}
 		reg := fmt.Sprintf("// The plugin's classes, for class_exists(), is_a() and is_subclass_of().\nfunc init() {\n%s([]string{\n%s,\n}, []string{%s})\n%s(map[string][]string{\n%s\n})\n}",
 			f.phpx("RegisterClasses"), strings.Join(classes, ",\n"), strings.Join(funcs, ", "), f.phpx("RegisterParents"), strings.Join(parents, "\n"))
+		statics = append(statics, funcRegs...)
 		if len(statics) > 0 {
 			reg += "\n\n// Static methods, constructors and constants, for $class::method() and new $class().\nfunc init() {\n" + strings.Join(statics, "\n") + "\n}"
 		}
@@ -455,6 +460,7 @@ func (cv *converter) emitClass(gf *goFile, c *class) string {
 	for _, ad := range c.adapters {
 		sb.WriteString(cv.emitAdapter(gf, c, ad))
 	}
+	sb.WriteString(cv.emitStaticHooks(gf, c))
 	sb.WriteString(fmt.Sprintf("// PhpClass is the PHP class name (get_class()).\nfunc (%s *%s) PhpClass() string { return %s }\n\n", c.Recv, c.GoName, quote(c.FQCN)))
 	if cv.implementsJSON(c) {
 		sb.WriteString(fmt.Sprintf("// MarshalJSON encodes the value jsonSerialize() returns.\nfunc (%s *%s) MarshalJSON() ([]byte, error) {\nreturn %s(%s(%s.JsonSerialize()))\n}\n\n",
@@ -875,7 +881,9 @@ func (cv *converter) emitEnum(gf *goFile, c *class) string {
 		c.GoName, c.Short, c.GoName, c.GoName, c.GoName, strings.Join(names, ", "), f.phpx("LooseEq")))
 	sb.WriteString(fmt.Sprintf("// %sFrom is %s::from().\nfunc %sFrom(v any) *%s {\nif c := %sTryFrom(v); c != nil {\nreturn c\n}\npanic(%s(\"ValueError\", %s(v)+\" is not a valid backing value for enum %s\"))\n}\n\n",
 		c.GoName, c.Short, c.GoName, c.GoName, c.GoName, f.phpx("NewError"), f.phpx("ToString"), strings.ReplaceAll(c.FQCN, `\`, `\\`)))
-	sb.WriteString(fmt.Sprintf("// Name is the case's name.\nfunc (%s *%s) Name() string { return %s.name }\n\n", c.Recv, c.GoName, c.Recv))
+	if m := c.findMethod("name"); m == nil || m.GoName != "Name" {
+		sb.WriteString(fmt.Sprintf("// Name is the case's name.\nfunc (%s *%s) Name() string { return %s.name }\n\n", c.Recv, c.GoName, c.Recv))
+	}
 	cv.emitStatics(&sb, gf, c)
 	for _, m := range c.Methods {
 		if m.Abstract || !m.HasBody {
@@ -979,4 +987,56 @@ func (cv *converter) isEventHandler(c *class, m *method) bool {
 		return lc.isEvent
 	}
 	return strings.Contains(t.Elem.Name, "/pocketmine/event/")
+}
+
+// emitStaticHooks writes instance methods for static PHP methods that the server calls on the
+// object (Entity::getNetworkTypeId() is static in PHP, GetNetworkTypeID() a method of
+// entity.Hooks in Go).
+func (cv *converter) emitStaticHooks(gf *goFile, c *class) string {
+	if c.Kind != kindClass {
+		return ""
+	}
+	var embed *api.Type
+	for k := c; k != nil; k = k.Parent {
+		if k.ExtEmbed != nil {
+			embed = k.ExtEmbed
+			break
+		}
+	}
+	if embed == nil {
+		return ""
+	}
+	hooks := cv.selfCtorHooks(embed)
+	if hooks == nil {
+		return ""
+	}
+	hms := cv.methodSet(hooks)
+	f := cv.newFctx(gf, c, nil)
+	var sb strings.Builder
+	for _, m := range c.Methods {
+		if !m.Static || !m.HasBody || len(m.Params) > 0 || m.Class != c {
+			continue
+		}
+		gn := findMethodName(hms, m.Name)
+		if gn == "" || len(hms[gn].Params) > 0 || len(hms[gn].Results) != 1 {
+			continue
+		}
+		if im := c.findMethod(m.Name); im != nil && !im.Static {
+			continue
+		}
+		clash := false
+		for _, o := range c.Methods {
+			if !o.Static && o.GoName == gn {
+				clash = true
+			}
+		}
+		if clash {
+			continue
+		}
+		rt := hms[gn].Results[0]
+		v := callv(m.GoName+"()", m.Return)
+		sb.WriteString(fmt.Sprintf("// %s is the static method %s::%s(), which the server calls on the object.\nfunc (%s *%s) %s() %s {\nreturn %s\n}\n\n",
+			gn, c.Short, m.Name, c.Recv, c.GoName, gn, f.typeStr(rt), f.coerce(v, rt)))
+	}
+	return sb.String()
 }

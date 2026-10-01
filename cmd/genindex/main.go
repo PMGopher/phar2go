@@ -28,18 +28,13 @@ func main() {
 		if *libs != "" {
 			dirs = append(dirs, strings.Split(*libs, ",")...)
 		}
-		idx.PHPConsts = map[string]api.PHPConst{}
-		for _, d := range dirs {
-			consts, err := api.GeneratePHPConsts(d)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-			for k, v := range consts {
-				idx.PHPConsts[k] = v
-			}
+		consts, defaults, err := api.GeneratePHPInfo(dirs)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
-		fmt.Printf("%d PocketMine-MP constants\n", len(idx.PHPConsts))
+		idx.PHPConsts, idx.PHPDefaults = consts, defaults
+		fmt.Printf("%d PocketMine-MP constants, %d methods with default arguments\n", len(idx.PHPConsts), len(idx.PHPDefaults))
 	}
 	if err := idx.Save(*out); err != nil {
 		fmt.Fprintln(os.Stderr, err)

@@ -65,6 +65,9 @@ type fctx struct {
 	dry     bool
 	labelN  *int
 
+	// extCallee is the PocketMine-MP method ("lower-case class::method") whose arguments the next
+	// callArgs converts, for the PHP default values of missing arguments.
+	extCallee string
 	// selfVar is the expression for $this as a value.
 	selfVar string
 	// stmtNode is the expression being converted as a statement (its value is unused).

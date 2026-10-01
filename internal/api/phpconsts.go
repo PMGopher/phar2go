@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,62 +31,109 @@ type rawConst struct {
 // GeneratePHPConsts reads the class constants with literal values from PocketMine-MP's source
 // (its src folder), for constants pocketmine-go doesn't have.
 func GeneratePHPConsts(src string) (map[string]PHPConst, error) {
+	consts, _, err := GeneratePHPInfo([]string{src})
+	return consts, err
+}
+
+// GeneratePHPInfo reads PocketMine-MP's source folders (and its libraries'): the class constants
+// with literal values, and the default values of the methods' parameters ("lower-case
+// class::method" -> one entry per parameter, nil when it has no literal default).
+func GeneratePHPInfo(srcs []string) (map[string]PHPConst, map[string][]*PHPConst, error) {
 	raw := map[string]*rawConst{}
-	err := filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(p, ".php") {
-			return err
-		}
-		data, err := os.ReadFile(p)
-		if err != nil {
-			return err
-		}
-		root, err := parser.Parse(data, conf.Config{Version: &version.Version{Major: 8, Minor: 1}})
-		if err != nil || root == nil {
-			return nil
-		}
-		nsr := nsresolver.NewNamespaceResolver()
-		traverser.NewTraverser(nsr).Traverse(root)
-		var walk func(stmts []ast.Vertex)
-		walk = func(stmts []ast.Vertex) {
-			for _, s := range stmts {
-				var class string
-				var body []ast.Vertex
-				switch x := s.(type) {
-				case *ast.StmtNamespace:
-					walk(x.Stmts)
-					continue
-				case *ast.StmtClass:
-					class, body = nsr.ResolvedNames[x], x.Stmts
-				case *ast.StmtInterface:
-					class, body = nsr.ResolvedNames[x], x.Stmts
-				case *ast.StmtEnum:
-					class, body = nsr.ResolvedNames[x], x.Stmts
-				default:
-					continue
-				}
-				for _, m := range body {
-					cl, ok := m.(*ast.StmtClassConstList)
-					if !ok {
+	parents := map[string][]string{} // class -> parent class and interfaces (lower case)
+	type rawDefaults struct {
+		class string
+		exprs []ast.Vertex
+		names map[ast.Vertex]string
+	}
+	rawDefs := map[string]*rawDefaults{}
+	var err error
+	for _, src := range srcs {
+		err = filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() || !strings.HasSuffix(p, ".php") {
+				return err
+			}
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			root, err := parser.Parse(data, conf.Config{Version: &version.Version{Major: 8, Minor: 1}})
+			if err != nil || root == nil {
+				return nil
+			}
+			nsr := nsresolver.NewNamespaceResolver()
+			traverser.NewTraverser(nsr).Traverse(root)
+			var walk func(stmts []ast.Vertex)
+			walk = func(stmts []ast.Vertex) {
+				for _, s := range stmts {
+					var class string
+					var body []ast.Vertex
+					switch x := s.(type) {
+					case *ast.StmtNamespace:
+						walk(x.Stmts)
+						continue
+					case *ast.StmtClass:
+						class, body = nsr.ResolvedNames[x], x.Stmts
+						var ps []string
+						if x.Extends != nil {
+							ps = append(ps, nsr.ResolvedNames[x.Extends])
+						}
+						for _, i := range x.Implements {
+							ps = append(ps, nsr.ResolvedNames[i])
+						}
+						for _, p := range ps {
+							parents[strings.ToLower(class)] = append(parents[strings.ToLower(class)], strings.ToLower(p))
+						}
+					case *ast.StmtInterface:
+						class, body = nsr.ResolvedNames[x], x.Stmts
+						for _, i := range x.Extends {
+							parents[strings.ToLower(class)] = append(parents[strings.ToLower(class)], strings.ToLower(nsr.ResolvedNames[i]))
+						}
+					case *ast.StmtEnum:
+						class, body = nsr.ResolvedNames[x], x.Stmts
+					default:
 						continue
 					}
-					for _, c := range cl.Consts {
-						k, ok := c.(*ast.StmtConstant)
+					for _, m := range body {
+						if cm, ok := m.(*ast.StmtClassMethod); ok {
+							rd := &rawDefaults{class: class, names: nsr.ResolvedNames}
+							has := false
+							for _, pv := range cm.Params {
+								var d ast.Vertex
+								if pp, ok := pv.(*ast.Parameter); ok {
+									d = pp.DefaultValue
+								}
+								rd.exprs = append(rd.exprs, d)
+								has = has || d != nil
+							}
+							if has {
+								rawDefs[strings.ToLower(class+"::"+string(cm.Name.(*ast.Identifier).Value))] = rd
+							}
+							continue
+						}
+						cl, ok := m.(*ast.StmtClassConstList)
 						if !ok {
 							continue
 						}
-						name := string(k.Name.(*ast.Identifier).Value)
-						raw[strings.ToLower(class+"::"+name)] = &rawConst{class: class, expr: k.Expr, names: nsr.ResolvedNames}
+						for _, c := range cl.Consts {
+							k, ok := c.(*ast.StmtConstant)
+							if !ok {
+								continue
+							}
+							name := string(k.Name.(*ast.Identifier).Value)
+							raw[strings.ToLower(class+"::"+name)] = &rawConst{class: class, expr: k.Expr, names: nsr.ResolvedNames}
+						}
 					}
 				}
 			}
+			if r, ok := root.(*ast.Root); ok {
+				walk(r.Stmts)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, nil, err
 		}
-		if r, ok := root.(*ast.Root); ok {
-			walk(r.Stmts)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	out := map[string]PHPConst{}
 	var eval func(key string, depth int) (PHPConst, bool)
@@ -152,6 +200,29 @@ func GeneratePHPConsts(src string) (map[string]PHPConst, error) {
 			return v, true
 		case *ast.ExprBrackets:
 			return evalExpr(rc, x.Expr, depth)
+		case *ast.ExprBitwiseNot:
+			v, ok := evalExpr(rc, x.Expr, depth)
+			if !ok || v.Kind != "int" {
+				return PHPConst{}, false
+			}
+			n, _ := strconv.ParseInt(v.Value, 10, 64)
+			return PHPConst{"int", strconv.FormatInt(^n, 10)}, true
+		case *ast.ExprArray:
+			// A list of scalars: Facing::ALL. Value is the elements, JSON-encoded.
+			var elems []PHPConst
+			for _, it := range x.Items {
+				item, ok := it.(*ast.ExprArrayItem)
+				if !ok || item.Key != nil || item.Val == nil || item.EllipsisTkn != nil {
+					return PHPConst{}, false
+				}
+				v, ok := evalExpr(rc, item.Val, depth)
+				if !ok || v.Kind == "array" {
+					return PHPConst{}, false
+				}
+				elems = append(elems, v)
+			}
+			data, _ := json.Marshal(elems)
+			return PHPConst{"array", string(data)}, true
 		case *ast.ExprClassConstFetch:
 			cls := rc.names[x.Class]
 			if cls == "" {
@@ -224,5 +295,99 @@ func GeneratePHPConsts(src string) (map[string]PHPConst, error) {
 	for key := range raw {
 		eval(key, 0)
 	}
-	return out, nil
+	// Inherited constants: Living::MOTION_THRESHOLD is Entity::MOTION_THRESHOLD.
+	byClass := map[string][]string{}
+	for key := range out {
+		i := strings.Index(key, "::")
+		byClass[key[:i]] = append(byClass[key[:i]], key[i+2:])
+	}
+	var inherit func(class string, depth int) map[string]PHPConst
+	inherit = func(class string, depth int) map[string]PHPConst {
+		res := map[string]PHPConst{}
+		if depth > 20 {
+			return res
+		}
+		for _, p := range parents[class] {
+			for k, v := range inherit(p, depth+1) {
+				res[k] = v
+			}
+		}
+		for _, n := range byClass[class] {
+			res[n] = out[class+"::"+n]
+		}
+		return res
+	}
+	for class := range parents {
+		for n, v := range inherit(class, 0) {
+			if _, ok := out[class+"::"+n]; !ok {
+				out[class+"::"+n] = v
+			}
+		}
+	}
+	// Default values of parameters.
+	defaults := map[string][]*PHPConst{}
+	for key, rd := range rawDefs {
+		rc := &rawConst{class: rd.class, names: rd.names}
+		var list []*PHPConst
+		any := false
+		for _, e := range rd.exprs {
+			if e == nil {
+				list = append(list, nil)
+				continue
+			}
+			if cf, ok := e.(*ast.ExprConstFetch); ok && strings.EqualFold(nameOf(cf.Const), "null") {
+				list = append(list, &PHPConst{Kind: "null"})
+				any = true
+				continue
+			}
+			if v, ok := evalExpr(rc, e, 0); ok {
+				list = append(list, &v)
+				any = true
+			} else {
+				list = append(list, nil)
+			}
+		}
+		if any {
+			defaults[key] = list
+		}
+	}
+	// Inherited methods: Position::up() is Vector3::up().
+	byClassM := map[string][]string{}
+	for key := range defaults {
+		i := strings.Index(key, "::")
+		byClassM[key[:i]] = append(byClassM[key[:i]], key[i+2:])
+	}
+	var inheritM func(class string, depth int) map[string][]*PHPConst
+	inheritM = func(class string, depth int) map[string][]*PHPConst {
+		res := map[string][]*PHPConst{}
+		if depth > 20 {
+			return res
+		}
+		for _, p := range parents[class] {
+			for k, v := range inheritM(p, depth+1) {
+				res[k] = v
+			}
+		}
+		for _, n := range byClassM[class] {
+			res[n] = defaults[class+"::"+n]
+		}
+		return res
+	}
+	for class := range parents {
+		for n, v := range inheritM(class, 0) {
+			if _, ok := defaults[class+"::"+n]; !ok {
+				defaults[class+"::"+n] = v
+			}
+		}
+	}
+	return out, defaults, nil
+}
+
+func nameOf(n ast.Vertex) string {
+	if nm, ok := n.(*ast.Name); ok && len(nm.Parts) > 0 {
+		if np, ok := nm.Parts[len(nm.Parts)-1].(*ast.NamePart); ok {
+			return string(np.Value)
+		}
+	}
+	return ""
 }

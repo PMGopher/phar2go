@@ -33,6 +33,9 @@ type class struct {
 	ParentName string   // FQCN of the parent class
 	IfaceNames []string // FQCNs of implemented (or, for interfaces, extended) interfaces
 	TraitNames []string
+	// TraitAliases and TraitExcluded are the trait adaptations (as, insteadof).
+	TraitAliases  []traitAlias
+	TraitExcluded map[string]bool
 
 	Parent       *class    // local parent
 	ExtParent    *api.Type // external parent (named type of the server), or nil
@@ -369,7 +372,8 @@ func (cv *converter) addClass(f *phpFile, n ast.Vertex, kind classKind) *class {
 	case *ast.StmtEnum:
 		c.FQCN = f.Names[x]
 		if c.FQCN == "" {
-			c.FQCN = identValue(x.Name)
+			// The namespace resolver doesn't name enums.
+			c.FQCN = namespaceOf(f, x) + identValue(x.Name)
 		}
 		if x.Type != nil {
 			c.EnumBacking = strings.ToLower(identValue(x.Type))
@@ -492,8 +496,24 @@ func (cv *converter) addMember(c *class, f *phpFile, s ast.Vertex) {
 		for _, t := range m.Traits {
 			c.TraitNames = append(c.TraitNames, cv.resolveName(f, t))
 		}
-		if len(m.Adaptations) > 0 {
-			cv.warnf(f.Path, "trait adaptations (insteadof/as) in %s are ignored", c.FQCN)
+		for _, a := range m.Adaptations {
+			switch ad := a.(type) {
+			case *ast.StmtTraitUseAlias:
+				ta := traitAlias{Method: strings.ToLower(identValue(ad.Method)), Alias: identValue(ad.Alias)}
+				if ad.Trait != nil {
+					ta.Trait = strings.ToLower(cv.resolveName(f, ad.Trait))
+				}
+				if ta.Alias != "" {
+					c.TraitAliases = append(c.TraitAliases, ta)
+				}
+			case *ast.StmtTraitUsePrecedence:
+				for _, other := range ad.Insteadof {
+					if c.TraitExcluded == nil {
+						c.TraitExcluded = map[string]bool{}
+					}
+					c.TraitExcluded[strings.ToLower(cv.resolveName(f, other))+"::"+strings.ToLower(identValue(ad.Method))] = true
+				}
+			}
 		}
 	case *ast.EnumCase:
 		c.EnumCases = append(c.EnumCases, &enumCase{Name: identValue(m.Name), Value: m.Expr})
@@ -546,7 +566,18 @@ func (cv *converter) mergeTraits() {
 				seen[t] = true
 				use(t.TraitNames)
 				for _, m := range t.Methods {
-					if c.method(m.Name) != nil {
+					for _, ta := range c.TraitAliases {
+						if ta.Method == m.Key && (ta.Trait == "" || ta.Trait == strings.ToLower(t.FQCN)) && c.method(ta.Alias) == nil {
+							cp := *m
+							cp.Name, cp.Key = ta.Alias, strings.ToLower(ta.Alias)
+							cp.Class = c
+							cp.FromTrait = t
+							cp.Params = cloneParams(m.Params, c)
+							c.Methods = append(c.Methods, &cp)
+							c.methodByKey[cp.Key] = &cp
+						}
+					}
+					if c.method(m.Name) != nil || c.TraitExcluded[strings.ToLower(t.FQCN)+"::"+m.Key] {
 						continue
 					}
 					cp := *m
@@ -679,4 +710,41 @@ func isThrowableClass(name string) bool {
 		return true
 	}
 	return false
+}
+
+// traitAlias is `Trait::method as alias`.
+type traitAlias struct {
+	Trait, Method, Alias string
+}
+
+// namespaceOf returns the namespace (with a trailing backslash) a top-level declaration is in.
+func namespaceOf(f *phpFile, n ast.Vertex) string {
+	root, ok := f.Root.(*ast.Root)
+	if !ok {
+		return ""
+	}
+	cur := ""
+	for _, s := range root.Stmts {
+		ns, ok := s.(*ast.StmtNamespace)
+		if s == n {
+			return cur
+		}
+		if !ok {
+			continue
+		}
+		name := ""
+		if ns.Name != nil {
+			name = identValue(ns.Name) + `\`
+		}
+		if ns.Stmts == nil {
+			cur = name
+			continue
+		}
+		for _, inner := range ns.Stmts {
+			if inner == n {
+				return name
+			}
+		}
+	}
+	return cur
 }

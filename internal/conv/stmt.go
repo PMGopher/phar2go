@@ -719,6 +719,11 @@ func (f *fctx) unset(v ast.Vertex) string {
 
 // closure converts a closure or arrow function.
 func (f *fctx) closure(params []ast.Vertex, uses []ast.Vertex, retNode ast.Vertex, stmts []ast.Vertex, arrow ast.Vertex, want *api.Type, n ast.Vertex) value {
+	if want != nil && want.K == api.KNamed {
+		if u := f.underlying(want); u != nil && u.K == api.KFunc {
+			want = u
+		}
+	}
 	g := f.child()
 	g.loops = nil
 	g.tryDepth = 0

@@ -355,6 +355,7 @@ func pluginGo(pkg, module, name, mainType, embed string, usesServer bool) string
 	create += "\t\t// Errors and skipped code of the converted plugin go to its logger.\n" +
 		"\t\tphpx.LogError = func(msg string) { p.GetLogger().Error(msg) }\n" +
 		"\t\tphpx.LogWarning = func(msg string) { p.GetLogger().Warning(msg) }\n" +
+		"\t\tphpx.Server = func() any { return p.GetServer() }\n" +
 		"\t\treturn p"
 	return fmt.Sprintf(`// Package %s is the %s plugin for pocketmine-go, converted from PocketMine-MP by phar2go.
 //

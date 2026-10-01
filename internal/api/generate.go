@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"go/ast"
+	"go/token"
 	"go/types"
 	"os/exec"
 	"regexp"
@@ -139,6 +140,15 @@ func genPackage(idx *Index, p *packages.Package) {
 			if !ok {
 				continue
 			}
+			if gd.Tok == token.VAR && gd.Doc != nil {
+				// A PHP class ported as functions and variables (GlobalItemDataHandlers).
+				if m := portOfType.FindStringSubmatch(gd.Doc.Text()); m != nil {
+					php := strings.TrimRight(m[1], `\.:`)
+					if _, ok := shortClasses[shortName(php)]; !ok {
+						shortClasses[shortName(php)] = php
+					}
+				}
+			}
 			for _, spec := range gd.Specs {
 				ts, ok := spec.(*ast.TypeSpec)
 				if !ok || !ts.Name.IsExported() {
@@ -186,6 +196,14 @@ func genPackage(idx *Index, p *packages.Package) {
 					if fd.Recv != nil {
 						if ti := pkg.Types[recvName(fd)]; ti != nil && ti.PHP != "" && shortName(ti.PHP) == class {
 							full = ti.PHP
+						}
+					}
+					if full == "" && fd.Recv == nil {
+						// A class ported as functions: its namespace is the package's path.
+						if p.Module != nil {
+							if rest, ok := strings.CutPrefix(p.PkgPath, p.Module.Path+"/pocketmine/"); ok {
+								full = `pocketmine\` + strings.ReplaceAll(rest, "/", `\`) + `\` + class
+							}
 						}
 					}
 					if full == "" {

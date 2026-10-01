@@ -2,6 +2,7 @@ package conv
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/VKCOM/php-parser/pkg/ast"
@@ -38,6 +39,8 @@ func phpArgs(args []ast.Vertex) []phpArg {
 func (f *fctx) callArgs(sig *api.Func, args []ast.Vertex, m *method) string {
 	list := phpArgs(args)
 	n := len(sig.Params)
+	callee := f.extCallee
+	f.extCallee = ""
 	// Named arguments.
 	if len(sig.ParamNames) > 0 {
 		named := false
@@ -130,7 +133,7 @@ func (f *fctx) callArgs(sig *api.Func, args []ast.Vertex, m *method) string {
 			out = append(out, f.defaultArg(m, m.Params[i], pt))
 			continue
 		}
-		if def, ok := f.extDefault(i, pt); ok {
+		if def, ok := f.extDefault(callee, i, pt); ok {
 			out = append(out, def)
 			continue
 		}
@@ -139,8 +142,36 @@ func (f *fctx) callArgs(sig *api.Func, args []ast.Vertex, m *method) string {
 	return strings.Join(out, ", ")
 }
 
-func (f *fctx) extDefault(i int, pt *api.Type) (string, bool) {
-	return "", false
+// extDefault is the PHP default value of parameter i of a PocketMine-MP method.
+func (f *fctx) extDefault(callee string, i int, pt *api.Type) (string, bool) {
+	defs := f.cv.idx.PHPDefaults[callee]
+	if callee == "" || i >= len(defs) || defs[i] == nil {
+		return "", false
+	}
+	d := defs[i]
+	var v value
+	switch d.Kind {
+	case "null":
+		return f.zero(pt), true
+	case "int":
+		v = value{code: d.Value, t: api.Int, prec: 7, konst: true}
+	case "float":
+		code := d.Value
+		if !strings.ContainsAny(code, ".eE") {
+			code += ".0"
+		}
+		v = value{code: code, t: api.Float, prec: 7, konst: true}
+	case "string":
+		v = value{code: quote(d.Value), t: api.String, prec: 7}
+	case "bool":
+		v = value{code: d.Value, t: api.Bool, prec: 7}
+	default:
+		return "", false
+	}
+	if strings.HasPrefix(d.Value, "-") {
+		v.prec = 6
+	}
+	return f.coerce(v, pt), true
 }
 
 // argCode converts one argument for a parameter of type pt.
@@ -320,6 +351,30 @@ func (f *fctx) callOn(obj value, name string, args []ast.Vertex, isThis bool, n 
 			}
 			return f.methodResult(recv+"."+m.GoName+"("+f.callArgs(m.Sig, args, m)+")", m)
 		}
+		// A method the server calls through its "self" (entity.LivingHooks): it may be overridden
+		// (or, if abstract, only implemented) by a subclass, so call it on the outermost object.
+		if isThis && f.selfVar != "" {
+			if hooks := f.cv.classHooks(c); hooks != nil {
+				hms := f.cv.methodSet(hooks)
+				if gn := findMethodName(hms, name); gn != "" {
+					return f.callResults(f.phpx("As")+"["+f.typeStr(hooks)+"]("+f.selfVar+")."+gn+"("+f.callArgs(hms[gn], args, nil)+")", hms[gn].Results)
+				}
+			}
+		}
+		// An alias of a method of a server trait: use ColoredTrait { setColor as traitSetColor; }.
+		if isThis && c == f.cls {
+			for _, ta := range c.TraitAliases {
+				if !strings.EqualFold(ta.Alias, name) {
+					continue
+				}
+				for _, et := range c.ExtTraits {
+					tms := f.cv.methodSet(api.Ptr(et))
+					if gn := findMethodName(tms, ta.Method); gn != "" {
+						return f.serverCall(f.recv+"."+et.ObjName()+"."+gn, tms[gn], args)
+					}
+				}
+			}
+		}
 		// A method of the server type the class extends.
 		ms := f.cv.localMethods[c.GoName]
 		if gn := findMethodName(ms, name); gn != "" {
@@ -338,6 +393,9 @@ func (f *fctx) callOn(obj value, name string, args []ast.Vertex, isThis bool, n 
 			return callv(f.phpx("Call")+"("+obj.code+", "+quote(name)+f.anyArgs(args)+")", api.Any)
 		}
 		f.warn(n, "method %s::%s() not found", c.FQCN, name)
+		if isThis && f.selfVar != "" {
+			return callv(f.phpx("Call")+"("+f.selfVar+", "+quote(name)+f.anyArgs(args)+")", api.Any)
+		}
 		return callv(f.phpx("Call")+"("+obj.code+", "+quote(name)+f.anyArgs(args)+")", api.Any)
 	}
 	if v, ok := f.specialMethod(obj, name, args); ok {
@@ -351,7 +409,31 @@ func (f *fctx) callOn(obj value, name string, args []ast.Vertex, isThis bool, n 
 		}
 	}
 	if gn := findMethodName(ms, name, extra...); gn != "" {
+		// PHP's getPosition() returns a Position (with its world); pocketmine-go's GetPosition()
+		// a Vector3, and GetLocation() a Location that has both.
+		if gn == "GetPosition" && len(args) == 0 {
+			if loc, ok := ms["GetLocation"]; ok && len(loc.Params) == 0 && len(loc.Results) == 1 && f.cv.hasWorldField(loc.Results[0]) {
+				gn = "GetLocation"
+			}
+		}
+		// A default value argument: $nbt->getInt("Name", 0) -> GetIntOr("Name", 0).
+		if len(phpArgs(args)) > len(ms[gn].Params) && !ms[gn].Variadic {
+			if or, ok := ms[gn+"Or"]; ok && len(or.Params) == len(phpArgs(args)) {
+				gn = gn + "Or"
+			}
+		}
+		if ti := f.cv.typeInfo(t.Deref()); ti != nil && ti.PHP != "" {
+			f.extCallee = strings.ToLower(ti.PHP + "::" + name)
+		}
 		return f.fluentOrCall(obj.code, t, gn, ms[gn], args, n)
+	}
+	// A position argument for a method taking coordinates: $world->getFullLight($pos) ->
+	// world.GetFullLightAt(x, y, z).
+	if len(phpArgs(args)) == 1 {
+		if gn := findMethodName(ms, name+"At"); gn != "" && len(ms[gn].Params) == 3 && ms[gn].Params[0].IsInt() && ms[gn].Params[1].IsInt() && ms[gn].Params[2].IsInt() {
+			arg := f.expr(phpArgs(args)[0].expr, nil)
+			return f.callResults(recv+"."+gn+"("+f.phpx("BlockXYZ")+"("+arg.code+"))", ms[gn].Results)
+		}
 	}
 	// A getter of a field: $pos->getX() -> pos.X, $loc->getWorld() -> loc.World.
 	if len(args) == 0 && len(name) > 3 && strings.EqualFold(name[:3], "get") {
@@ -371,6 +453,11 @@ func (f *fctx) callOn(obj value, name string, args []ast.Vertex, isThis bool, n 
 		}
 		if ct, gn := f.cv.concreteFor(t, goMethodNames(name)); ct != nil {
 			sig := f.cv.methodSet(ct)[gn]
+			if len(sig.Results) > 0 || n == f.stmtNode {
+				// Assert the method, not the type: the value may be a plugin type embedding it
+				// (a plugin.Plugin is the plugin's main type, which embeds PluginBase).
+				return f.serverCall(recv+".(interface{ "+gn+f.sigStr(sig, nil)+" })."+gn, sig, args)
+			}
 			return f.fluentOrCall(recv+".("+f.typeStr(ct)+")", ct, gn, sig, args, n)
 		}
 	}
@@ -475,6 +562,24 @@ func (f *fctx) specialMethod(obj value, name string, args []ast.Vertex) (value, 
 	switch {
 	case t.K == api.KNamed && t.Name == f.cv.idx.Module+"/pocketmine/math.Vector3":
 		// Vector3 is a value type: its methods return new values.
+	case strings.EqualFold(name, "getPotentialBlockSkyLightAt") && t.K == api.KNamed && strings.HasSuffix(t.Name, "/pocketmine/world.World"):
+		// Unexported in pocketmine-go.
+		return callv(f.phpx("WorldPotentialBlockSkyLightAt")+"("+obj.code+f.anyArgs(args)+")", api.Int), true
+	case (strings.EqualFold(name, "getMinY") || strings.EqualFold(name, "getMaxY")) && len(args) == 0 && t.K == api.KNamed && strings.HasSuffix(t.Name, "/pocketmine/world.World"):
+		if strings.EqualFold(name, "getMinY") {
+			return callv(f.pkgRef(f.cv.idx.Module+"/pocketmine/world")+".YMin", api.Int), true
+		}
+		return callv(f.pkgRef(f.cv.idx.Module+"/pocketmine/world")+".YMax", api.Int), true
+	case strings.EqualFold(name, "getServer") && len(args) == 0 && t.K == api.KNamed && strings.HasPrefix(t.Name, f.cv.idx.Module+"/") && findMethodName(f.cv.methodSet(obj.t), "getServer") == "":
+		// $world->getServer(), $entity->getServer(): there is one server.
+		f.cv.usesServer = true
+		return callv("phar2goServer()", api.Ptr(api.Named(f.cv.idx.Module+"/pocketmine/server.Server"))), true
+	case strings.EqualFold(name, "asVector3") && len(args) == 0 && t.K == api.KNamed && strings.HasSuffix(t.Name, "/pocketmine/math.Vector3") && findMethodName(f.cv.methodSet(obj.t), name) == "":
+		return value{code: f.coerce(obj, t), t: t, prec: 7}, true
+	case strings.EqualFold(name, "addWorkerStartHook") && t.K == api.KNamed && strings.HasSuffix(t.Name, ".AsyncPool"):
+		// PHP workers are threads with their own copy of everything, and start hooks set them up
+		// like the main thread (registering items again); Go's workers share the server's memory.
+		return callv("", api.Void), true
 	}
 	return value{}, false
 }
@@ -525,9 +630,21 @@ func (f *fctx) staticCall(x *ast.ExprStaticCall) value {
 					return f.parentExtCall("Exception", name, x.Args, x)
 				}
 			}
+			// __callStatic() (like the members of RegistryTrait registries).
+			if cs := c.findMethod("__callStatic"); cs != nil && cs.Static {
+				return f.methodResult(cs.GoName+"("+quote(name)+", "+f.phpx("List")+"("+strings.TrimPrefix(f.anyArgs(x.Args), ", ")+"))", cs)
+			}
 			return callv(f.todo(x, "method %s::%s() not found", c.FQCN, name)+f.phpx("Unsupported")+"("+quote(name)+f.anyArgs(x.Args)+")", api.Any)
 		}
 		if m.Static {
+			// Late static binding: static::method() from an object calls its class's override.
+			if strings.EqualFold(identValue(x.Class), "static") && !f.static && c.Poly && f.selfVar != "" && (!m.HasBody || f.cv.overriddenStatic(c, m.Key)) {
+				v := callv(f.phpx("CallStatic")+"("+f.phpx("ClassName")+"("+f.selfVar+"), "+quote(name)+f.anyArgs(x.Args)+")", api.Any)
+				if m.Return != nil && !m.Return.IsVoid() {
+					return value{code: f.coerce(v, m.Return), t: m.Return, prec: 7, call: true}
+				}
+				return v
+			}
 			return f.methodResult(m.GoName+"("+f.callArgs(m.Sig, x.Args, m)+")", m)
 		}
 		if f.static || f.cls == nil {
@@ -582,6 +699,9 @@ func (f *fctx) parentExtCall(php, name string, args []ast.Vertex, n ast.Vertex) 
 	}
 	field += "." + embed.ObjName()
 	if lname == "__construct" {
+		if code, ok := f.extSelfCtor(field, embed, args); ok {
+			return value{code: code, t: api.Void, call: true}
+		}
 		code, ok := f.extInit(php, embed, args, n)
 		if !ok {
 			return callv("", api.Void)
@@ -600,19 +720,113 @@ func (f *fctx) parentExtCall(php, name string, args []ast.Vertex, n ast.Vertex) 
 	return callv(f.todo(n, "parent::%s() not found on %s", name, php)+f.phpx("Unsupported")+"("+quote(name)+f.anyArgs(args)+")", api.Any)
 }
 
+// extSelfCtor calls the constructor method of an embedded server type that takes the outermost
+// object as its "self" (Living.ConstructLiving(self, ...), ItemBase.Init(self, ...)), so that
+// the server calls the plugin's overrides.
+func (f *fctx) extSelfCtor(field string, embed *api.Type, args []ast.Vertex) (string, bool) {
+	ms := f.cv.methodSet(api.Ptr(embed))
+	for _, name := range []string{"Construct" + embed.ObjName(), "Construct", "Init"} {
+		fn, ok := ms[name]
+		if !ok || len(fn.Params) == 0 || fn.Variadic || len(fn.Results) > 0 || len(phpArgs(args)) > len(fn.Params)-1 {
+			continue
+		}
+		hooks := fn.Params[0]
+		if hooks.K != api.KNamed || !isExportedName(hooks.ObjName()) || !f.cv.isInterface(hooks) {
+			continue
+		}
+		self := f.recv
+		if f.selfVar != "" {
+			self = f.selfVar
+		}
+		rest := &api.Func{Params: fn.Params[1:]}
+		if len(fn.ParamNames) > 0 {
+			rest.ParamNames = fn.ParamNames[1:]
+		}
+		callArgs := f.callArgs(rest, args, nil)
+		if callArgs != "" {
+			callArgs = ", " + callArgs
+		}
+		return field + "." + name + "(" + f.phpx("As") + "[" + f.typeStr(hooks) + "](" + self + ")" + callArgs + ")", true
+	}
+	return "", false
+}
+
+// hasWorldField reports whether t is a struct with an embedded Vector3 and a World field
+// (entity.Location).
+func (cv *converter) hasWorldField(t *api.Type) bool {
+	ti := cv.typeInfo(t)
+	if ti == nil {
+		return false
+	}
+	_, v := ti.Fields["Vector3"]
+	_, w := ti.Fields["World"]
+	return v && w
+}
+
+func isExportedName(s string) bool { return s != "" && s[0] >= 'A' && s[0] <= 'Z' }
+
+// selfCtorParams is the number of PHP arguments of an embedded type's self-taking constructor
+// method (see extSelfCtor), or -1.
+func (cv *converter) selfCtorParams(embed *api.Type) int {
+	if fn := cv.selfCtor(embed); fn != nil {
+		return len(fn.Params) - 1
+	}
+	return -1
+}
+
+// selfCtorHooks is the "self" interface of an embedded type's self-taking constructor, or nil.
+func (cv *converter) selfCtorHooks(embed *api.Type) *api.Type {
+	if fn := cv.selfCtor(embed); fn != nil {
+		return fn.Params[0]
+	}
+	return nil
+}
+
+// classHooks is the "self" interface of the server type a class extends, or nil.
+func (cv *converter) classHooks(c *class) *api.Type {
+	for k := c; k != nil; k = k.Parent {
+		if k.ExtEmbed != nil {
+			return cv.selfCtorHooks(k.ExtEmbed)
+		}
+	}
+	return nil
+}
+
+func (cv *converter) selfCtor(embed *api.Type) *api.Func {
+	ms := cv.methodSet(api.Ptr(embed))
+	for _, name := range []string{"Construct" + embed.ObjName(), "Construct", "Init"} {
+		fn, ok := ms[name]
+		if !ok || len(fn.Params) == 0 || fn.Variadic || len(fn.Results) > 0 {
+			continue
+		}
+		if h := fn.Params[0]; h.K == api.KNamed && isExportedName(h.ObjName()) && cv.isInterface(h) {
+			return fn
+		}
+	}
+	return nil
+}
+
+// extCtorCands are the names of the functions that may construct an embedded server type.
+func (cv *converter) extCtorCands(php string, embed *api.Type) []string {
+	pkg := cv.idx.Packages[embed.PkgPath()]
+	if pkg == nil {
+		return nil
+	}
+	tn := embed.ObjName()
+	var cands []string
+	if target, ok := cv.idx.PHPMembers[strings.ToLower(php+"::__construct")]; ok && !strings.Contains(strings.TrimPrefix(target, pkg.Path+"."), ".") {
+		cands = append(cands, strings.TrimPrefix(target, pkg.Path+"."))
+	}
+	return append(cands, "Init"+tn, "New"+tn+"Base", "New"+tn)
+}
+
 // extInit finds how to initialise an embedded server type (parent::__construct).
 func (f *fctx) extInit(php string, embed *api.Type, args []ast.Vertex, n ast.Vertex) (string, bool) {
 	pkg := f.cv.idx.Packages[embed.PkgPath()]
 	if pkg == nil {
 		return "", false
 	}
-	tn := embed.ObjName()
-	var cands []string
-	if target, ok := f.cv.idx.PHPMembers[strings.ToLower(php+"::__construct")]; ok && !strings.Contains(strings.TrimPrefix(target, pkg.Path+"."), ".") {
-		cands = append(cands, strings.TrimPrefix(target, pkg.Path+"."))
-	}
-	cands = append(cands, "Init"+tn, "New"+tn+"Base", "New"+tn)
-	for _, c := range cands {
+	for _, c := range f.cv.extCtorCands(php, embed) {
 		fn, ok := pkg.Funcs[c]
 		if !ok || len(fn.Results) == 0 || fn.TypeParams > 0 {
 			continue
@@ -639,9 +853,13 @@ func (f *fctx) extInit(php string, embed *api.Type, args []ast.Vertex, n ast.Ver
 func (f *fctx) extStaticCall(php, name string, args []ast.Vertex, n ast.Vertex) value {
 	lname := strings.ToLower(name)
 	key := strings.ToLower(php + "::" + name)
+	if key == "closure::fromcallable" {
+		return callv(f.phpx("ClosureFromCallable")+"("+strings.TrimPrefix(f.anyArgs(args), ", ")+")", api.Any)
+	}
 	if target, ok := f.cv.idx.PHPMembers[key]; ok {
 		if fn := f.cv.idx.Func(target); fn != nil && fn.TypeParams == 0 {
 			i := strings.LastIndexByte(target, '.')
+			f.extCallee = key
 			return f.serverCall(f.pkgRef(target[:i])+"."+target[i+1:], fn, args)
 		}
 	}
@@ -711,10 +929,45 @@ func (f *fctx) extStaticCall(php, name string, args []ast.Vertex, n ast.Vertex) 
 	}
 	for _, cand := range cands {
 		if fn, ok := pkg.Funcs[cand]; ok && fn.TypeParams == 0 {
+			f.extCallee = key
 			return f.serverCall(ref+cand, fn, args)
 		}
 	}
+	if fn, ok := runtimeStatics[key]; ok {
+		list := phpArgs(args)
+		switch lname {
+		case "getxz", "getblockxyz":
+			// By-reference results: World::getXZ($hash, $x, $z).
+			if len(list) < 2 {
+				break
+			}
+			tmp := f.newTmp("h")
+			stmts := []string{tmp + " := " + f.phpx(fn) + "(" + f.coerce(f.expr(list[0].expr, api.Int), api.Int) + ")"}
+			for i, a := range list[1:] {
+				stmts = append(stmts, f.assignValue(a.expr, value{code: tmp + "[" + itoa(i) + "]", t: api.Int, prec: 7}))
+			}
+			return callv("func() {\n"+strings.Join(stmts, "\n")+"\n}()", api.Void)
+		}
+		return callv(f.phpx(fn)+"("+strings.TrimPrefix(f.anyArgs(args), ", ")+")", api.Int)
+	}
 	return callv(f.todo(n, "static method %s::%s() has no pocketmine-go equivalent", php, name)+f.phpx("Unsupported")+"("+quote(php+"::"+name)+f.anyArgs(args)+")", api.Any)
+}
+
+// runtimeStatics are static methods of PocketMine-MP that the runtime implements.
+var runtimeStatics = map[string]string{
+	`pocketmine\utils\binary::signbyte`:      "BinarySignByte",
+	`pocketmine\utils\binary::unsignbyte`:    "BinaryUnsignByte",
+	`pocketmine\utils\binary::signshort`:     "BinarySignShort",
+	`pocketmine\utils\binary::unsignshort`:   "BinaryUnsignShort",
+	`pocketmine\utils\binary::signint`:       "BinarySignInt",
+	`pocketmine\utils\binary::unsignint`:     "BinaryUnsignInt",
+	`pocketmine\item\itemtypeids::newid`:     "ItemTypeIdsNewId",
+	`pocketmine\block\blocktypeids::newid`:   "BlockTypeIdsNewId",
+	`pocketmine\world\world::chunkhash`:      "WorldChunkHash",
+	`pocketmine\world\world::getxz`:          "WorldGetXZ",
+	`pocketmine\world\world::blockhash`:      "WorldBlockHash",
+	`pocketmine\world\world::chunkblockhash`: "WorldBlockHash",
+	`pocketmine\world\world::getblockxyz`:    "WorldGetBlockXYZ",
 }
 
 // newExpr converts new Class(...).
@@ -728,7 +981,7 @@ func (f *fctx) newExpr(x *ast.ExprNew) value {
 		return f.newLocal(c, sc.Args, x)
 	}
 	name := identValue(x.Class)
-	if name == "" {
+	if _, isVar := x.Class.(*ast.ExprVariable); name == "" || isVar || strings.HasPrefix(name, "$") {
 		cls := f.expr(x.Class, nil)
 		return callv(f.phpx("New")+"("+cls.code+f.anyArgs(x.Args)+")", api.Any)
 	}
@@ -763,11 +1016,6 @@ func (f *fctx) newExpr(x *ast.ExprNew) value {
 		return callv(f.phpx("NewException")+"("+quote(full)+", "+msg+extra+")", throwableT)
 	}
 	switch strings.ToLower(full) {
-	case "arrayobject", "arrayiterator":
-		if len(x.Args) > 0 {
-			return callv(f.phpx("ToArray")+"("+f.expr(phpArgs(x.Args)[0].expr, nil).code+")", arrayT(nil, nil))
-		}
-		return callv(f.phpx("NewArray")+"()", arrayT(nil, nil))
 	case "stdclass":
 		return callv(f.phpx("NewArray")+"()", arrayT(nil, nil))
 	}
@@ -822,14 +1070,41 @@ func (f *fctx) newExt(php string, args []ast.Vertex, n ast.Vertex) value {
 		}
 	}
 	cands = append(cands, "New"+typeName, "New"+lastSeg(php))
+	// Constructors for optional arguments: NewEntitySizeInfoWithEyeHeight.
+	var with []string
+	for name := range pkg.Funcs {
+		if strings.HasPrefix(name, "New"+typeName+"With") {
+			with = append(with, name)
+		}
+	}
+	sort.Strings(with)
+	cands = append(cands, with...)
 	nargs := len(phpArgs(args))
 	for _, c := range cands {
 		fn, ok := pkg.Funcs[c]
-		if !ok || fn.TypeParams > 0 || len(fn.Results) == 0 {
+		if !ok || len(fn.Results) == 0 {
 			continue
+		}
+		inst := ""
+		if fn.TypeParams > 0 {
+			// A generic constructor (promise.NewResolver[T]) for the type's arguments.
+			if t == nil || len(t.Deref().Args) != fn.TypeParams {
+				continue
+			}
+			var targs []string
+			for _, a := range t.Deref().Args {
+				targs = append(targs, f.typeStr(a))
+			}
+			inst = "[" + strings.Join(targs, ", ") + "]"
 		}
 		if !fn.Variadic && nargs > len(fn.Params) {
 			continue
+		}
+		f.extCallee = strings.ToLower(php + "::__construct")
+		if inst != "" {
+			v := f.serverCall(ref+c+inst, fn, args)
+			v.t = t
+			return v
 		}
 		return f.serverCall(ref+c, fn, args)
 	}
@@ -875,4 +1150,17 @@ func (cv *converter) localImplementor(t *api.Type, name string) *class {
 func isClientOnly(php string) bool {
 	l := strings.ToLower(strings.TrimPrefix(php, "\\"))
 	return strings.HasPrefix(l, `pocketmine\network\mcpe\protocol\`)
+}
+
+// overriddenStatic reports whether a subclass of c redeclares the static method.
+func (cv *converter) overriddenStatic(c *class, key string) bool {
+	for _, sc := range c.Subclasses {
+		if m := sc.methodByKey[key]; m != nil && m.Class == sc {
+			return true
+		}
+		if cv.overriddenStatic(sc, key) {
+			return true
+		}
+	}
+	return false
 }

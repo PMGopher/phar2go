@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -110,10 +111,23 @@ func YamlEmit(v any, _ ...any) string {
 }
 
 // Serialize is serialize($value); it uses JSON, which unserialize() reads back.
-func Serialize(v any) string { return ToString(JsonEncode(v)) }
+func Serialize(v any) string {
+	if hasObject(v) {
+		return serializeObject(v)
+	}
+	return ToString(JsonEncode(v))
+}
 
 // Unserialize reads values written by Serialize.
-func Unserialize(s string, _ ...any) any { return JsonDecode(s, true) }
+func Unserialize(s string, _ ...any) any {
+	if strings.HasPrefix(s, serialPrefix) {
+		if v, ok := unserializeObject(s); ok {
+			return v
+		}
+		return false
+	}
+	return JsonDecode(s, true)
+}
 
 func FileExists(p string) bool { _, err := os.Stat(p); return err == nil }
 func IsFile(p string) bool     { st, err := os.Stat(p); return err == nil && !st.IsDir() }
@@ -674,11 +688,35 @@ func GetParentClass(v any) any {
 var (
 	staticMethods = map[string]map[string]any{}
 	constructors  = map[string]any{}
+	classConsts   = map[string][]classConst{}
 )
+
+type classConst struct {
+	name  string
+	value any
+}
+
+// Phar2goClassConstants is ReflectionClass::getConstants(): the constants of a plugin class
+// and its parents, by name.
+func Phar2goClassConstants(class any) *Array {
+	c := classOf(class)
+	out := NewArray()
+	for _, k := range append([]string{c}, classParents[c]...) {
+		for _, cc := range classConsts[k] {
+			if _, ok := out.Lookup(cc.name); !ok {
+				out.Set(cc.name, Invoke(cc.value))
+			}
+		}
+	}
+	return out
+}
 
 // RegisterStatic records a static method of a plugin class, for $class::method().
 func RegisterStatic(class, method string, fn any) {
 	class = strings.ToLower(class)
+	if name, ok := strings.CutPrefix(method, "const:"); ok {
+		classConsts[class] = append(classConsts[class], classConst{name, fn})
+	}
 	if staticMethods[class] == nil {
 		staticMethods[class] = map[string]any{}
 	}
@@ -717,4 +755,18 @@ func New(class any, args ...any) any {
 	}
 	Throw(NewError("Error", "Class \""+c+"\" not found"))
 	return nil
+}
+
+// ReflectType is the Go type of a plugin class (by name) or of an object, for APIs that take a
+// reflect.Type where PHP takes a class name (EntityFactory::register()).
+func ReflectType(class any) reflect.Type {
+	if s, ok := class.(string); ok {
+		if fn, ok := constructors[classOf(s)]; ok {
+			if t := reflect.TypeOf(fn); t.Kind() == reflect.Func && t.NumOut() > 0 {
+				return t.Out(0)
+			}
+		}
+		Throw(NewError("Error", "Class \""+s+"\" not found"))
+	}
+	return reflect.TypeOf(class)
 }

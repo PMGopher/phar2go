@@ -1,6 +1,7 @@
 package conv
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -880,6 +881,11 @@ func (f *fctx) staticPropFetch(x *ast.ExprStaticPropertyFetch) value {
 			return value{code: p.GoName, t: p.Type, prec: 7, lvalue: true}
 		}
 	}
+	if strings.EqualFold(php, `pocketmine\timings\Timings`) {
+		// PocketMine-MP's timings handlers: pocketmine-go has its own; start/stopTiming on null
+		// do nothing.
+		return prim("nil", api.Any)
+	}
 	return callv(f.todo(x, "static property %s::$%s not found", php, name)+f.phpx("Unsupported")+"("+quote("static property "+name)+")", api.Any)
 }
 
@@ -910,6 +916,21 @@ func (f *fctx) classConst(x *ast.ExprClassConstFetch) value {
 		}
 		if cd := c.findConst(name); cd != nil {
 			return value{code: cd.GoName, t: cd.Type, prec: 7, konst: cd.isConst && cd.Type != nil && cd.Type.IsNumber()}
+		}
+		// A constant of a server class or interface the class extends.
+		for k := c; k != nil; k = k.Parent {
+			exts := k.IfaceNames
+			if k.ExtParentPH != "" {
+				exts = append([]string{k.ExtParentPH}, exts...)
+			}
+			for _, php := range exts {
+				if f.cv.classes[strings.ToLower(php)] != nil {
+					continue
+				}
+				if v, ok := f.extConst(php, name); ok {
+					return v
+				}
+			}
 		}
 		return callv(f.todo(x, "constant %s::%s not found", c.FQCN, name)+f.phpx("Unsupported")+"("+quote("constant "+name)+")", api.Any)
 	}
@@ -985,6 +1006,26 @@ func (f *fctx) phpConst(php, name string) (value, bool) {
 		return value{code: code, t: api.Float, prec: 7, konst: true}, true
 	case "bool":
 		return prim(c.Value, api.Bool), true
+	case "array":
+		var elems []api.PHPConst
+		if json.Unmarshal([]byte(c.Value), &elems) != nil {
+			return value{}, false
+		}
+		var parts []string
+		for _, e := range elems {
+			switch e.Kind {
+			case "string":
+				parts = append(parts, quote(e.Value))
+			case "float":
+				if !strings.ContainsAny(e.Value, ".eE") {
+					e.Value += ".0"
+				}
+				parts = append(parts, e.Value)
+			default:
+				parts = append(parts, e.Value)
+			}
+		}
+		return callv(f.phpx("List")+"("+strings.Join(parts, ", ")+")", arrayT(api.Int, api.Any)), true
 	}
 	return prim(quote(c.Value), api.String), true
 }

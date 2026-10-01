@@ -2,6 +2,8 @@ package phpx
 
 import (
 	"fmt"
+	"io/fs"
+	"math"
 	"reflect"
 	"strings"
 	"unicode"
@@ -49,16 +51,77 @@ func Call(obj any, method string, args ...any) any {
 		return nil
 	}
 	if IsNull(obj) {
+		switch strings.ToLower(method) {
+		case "starttiming", "stoptiming", "time":
+			// PocketMine-MP's timings (TimingsHandler): pocketmine-go has its own.
+			return nil
+		}
 		Throw(NewError("Error", fmt.Sprintf("Call to a member function %s() on null", method)))
+	}
+	if fi, ok := obj.(fs.FileInfo); ok {
+		if v, ok := fileInfoMethod(fi, method); ok {
+			return v
+		}
 	}
 	m := methodByPHPName(reflect.ValueOf(obj), method)
 	if !m.IsValid() {
-		if a, ok := obj.(*Array); ok {
-			_ = a
+		if fn, ok := methodShims[reflect.TypeOf(obj).String()+"::"+strings.ToLower(method)]; ok {
+			return fn(obj, args...)
+		}
+		// $world->getServer(), $entity->getServer(): there is one server.
+		if strings.EqualFold(method, "getServer") && len(args) == 0 && Server != nil {
+			return Server()
+		}
+		// $world->getFullLight($pos) -> world.GetFullLightAt(x, y, z).
+		if len(args) == 1 {
+			if at := methodByPHPName(reflect.ValueOf(obj), method+"At"); at.IsValid() && at.Type().NumIn() == 3 {
+				x, y, z := BlockXYZ(args[0])
+				return callValue(at, []any{x, y, z})
+			}
+		}
+		// $pos->asVector3(): the value itself, or the embedded Vector3 of a Location.
+		if len(args) == 0 && len(method) > 2 && strings.EqualFold(method[:2], "as") {
+			want := method[2:]
+			rv := reflect.ValueOf(obj)
+			for rv.Kind() == reflect.Pointer && !rv.IsNil() {
+				rv = rv.Elem()
+			}
+			if strings.EqualFold(rv.Type().Name(), want) {
+				return rv.Interface()
+			}
+			if rv.Kind() == reflect.Struct {
+				if fv := rv.FieldByNameFunc(func(n string) bool { return strings.EqualFold(n, want) }); fv.IsValid() && fv.CanInterface() {
+					return fv.Interface()
+				}
+			}
+		}
+		// A getter of a field: $pos->getX() -> pos.X.
+		if len(args) == 0 && len(method) > 3 && strings.EqualFold(method[:3], "get") {
+			rv := reflect.ValueOf(obj)
+			for rv.Kind() == reflect.Pointer && !rv.IsNil() {
+				rv = rv.Elem()
+			}
+			if rv.Kind() == reflect.Struct {
+				if fv := rv.FieldByNameFunc(func(n string) bool { return strings.EqualFold(n, method[3:]) }); fv.IsValid() && fv.CanInterface() {
+					return FromGo(fv.Interface())
+				}
+			}
 		}
 		Throw(NewError("Error", fmt.Sprintf("Call to undefined method %s::%s()", ClassName(obj), method)))
 	}
+	if defs, ok := dynamicDefaults[strings.ToLower(method)]; ok && len(args) < m.Type().NumIn() {
+		for i := len(args); i < len(defs) && i < m.Type().NumIn(); i++ {
+			args = append(args, defs[i])
+		}
+	}
 	return callValue(m, args)
+}
+
+// dynamicDefaults are PHP default arguments of common PocketMine-MP methods, for calls on
+// values whose type isn't known when converting ($pos->up() is $pos->up(1)).
+var dynamicDefaults = map[string][]any{
+	"up": {1}, "down": {1}, "north": {1}, "south": {1}, "east": {1}, "west": {1},
+	"getside": {nil, 1},
 }
 
 // Invoke calls a PHP callable: a closure, [$object, "method"], or "Class::method" is not
@@ -82,8 +145,16 @@ func Invoke(fn any, args ...any) any {
 		return nil
 	case *Array:
 		if f.Len() == 2 {
+			if class, ok := f.Get(0).(string); ok {
+				return CallStatic(class, ToString(f.Get(1)), args...)
+			}
 			return Call(f.Get(0), ToString(f.Get(1)), args...)
 		}
+	case string:
+		if target, ok := stringCallable(f); ok {
+			return Invoke(target, args...)
+		}
+		Throw(NewError("Error", "Call to undefined function "+f+"()"))
 	}
 	if IsNull(fn) {
 		Throw(NewError("Error", "Value not callable"))
@@ -345,6 +416,20 @@ func Iter(v any) []Entry {
 		return c
 	case interface{ PhpIterate() []Entry }:
 		return c.PhpIterate()
+	case interface {
+		Rewind()
+		Valid() bool
+		Current() any
+		Key() any
+		Next()
+	}:
+		var out []Entry
+		for c.Rewind(); c.Valid(); c.Next() {
+			out = append(out, Entry{c.Key(), c.Current()})
+		}
+		return out
+	case interface{ GetIterator() any }:
+		return Iter(c.GetIterator())
 	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
@@ -480,3 +565,122 @@ func Stub(what string, _ ...any) any {
 	}
 	return &StubObject{Class: strings.TrimPrefix(class, "new ")}
 }
+
+var functions = map[string]any{}
+
+// RegisterFunction records a function of the converted plugin, for callables given as strings.
+func RegisterFunction(name string, fn any) { functions[strings.ToLower(name)] = fn }
+
+// Phar2goNew is `new $class(...$args)` for phar2go's PHP helpers (ReflectionClass).
+func Phar2goNew(class any, args ...any) any { return New(class, args...) }
+
+// stringCallable resolves a callable given as a string: "function" or "Class::method".
+func stringCallable(name string) (any, bool) {
+	if i := strings.Index(name, "::"); i >= 0 {
+		class, method := name[:i], name[i+2:]
+		return func(args ...any) any { return CallStatic(class, method, args...) }, true
+	}
+	l := strings.ToLower(strings.TrimPrefix(name, "\\"))
+	if fn, ok := functions[l]; ok {
+		return fn, true
+	}
+	if fn, ok := builtinFunctions[l]; ok {
+		return fn, true
+	}
+	return nil, false
+}
+
+// builtinFunctions are the PHP functions plugins commonly pass as callables
+// (array_map("trim", ...), usort($a, "strcmp"), ...).
+var builtinFunctions map[string]any
+
+func init() {
+	builtinFunctions = map[string]any{
+		"strtolower": Strtolower, "strtoupper": Strtoupper, "ucfirst": Ucfirst, "lcfirst": Lcfirst,
+		"ucwords": Ucwords, "trim": Trim, "ltrim": Ltrim, "rtrim": Rtrim, "strlen": Strlen,
+		"strrev": Strrev, "strval": Strval, "intval": Intval, "floatval": Floatval, "boolval": Boolval,
+		"is_numeric": IsNumeric, "is_string": IsString, "is_int": IsInt, "is_float": IsFloat,
+		"is_bool": IsBool, "is_array": IsArray, "is_null": IsNull, "is_object": IsObject,
+		"is_callable": IsCallable, "abs": Abs, "floor": Floor, "ceil": Ceil, "round": Round,
+		"sqrt": Sqrt, "strcmp": Strcmp, "strcasecmp": Strcasecmp, "strnatcmp": Strnatcmp,
+		"strnatcasecmp": Strnatcasecmp, "count": Count, "json_encode": JsonEncode,
+		"json_decode": JsonDecode, "base64_encode": Base64Encode, "base64_decode": Base64Decode,
+		"md5": Md5, "sha1": Sha1, "crc32": Crc32, "htmlspecialchars": Htmlspecialchars,
+		"strip_tags": StripTags, "addslashes": Addslashes, "stripslashes": Stripslashes,
+		"array_sum": ArraySum, "array_values": ArrayValues, "array_keys": ArrayKeys,
+		"array_unique": ArrayUnique, "array_reverse": ArrayReverse, "array_filter": ArrayFilter,
+		"max": Max, "min": Min, "implode": Implode, "explode": Explode, "str_repeat": StrRepeat,
+		"mb_strtolower": MbStrtolower, "mb_strtoupper": MbStrtoupper, "mb_strlen": MbStrlen,
+		"nl2br": Nl2br, "ord": Ord, "chr": Chr, "dechex": Dechex, "hexdec": Hexdec,
+		"bin2hex": Bin2hex, "var_dump": VarDump, "print_r": PrintR, "serialize": Serialize,
+		"unserialize": Unserialize, "spl_object_id": SplObjectId, "spl_object_hash": SplObjectHash,
+		"gettype": Gettype, "get_class": GetClass, "file_exists": FileExists, "is_dir": IsDir,
+		"is_file": IsFile, "unlink": Unlink, "basename": Basename, "dirname": Dirname,
+		"array_merge": ArrayMerge, "in_array": InArray, "sprintf": Sprintf, "microtime": Microtime,
+		"time": Time, "mt_rand": MtRand, "rand": Rand,
+	}
+}
+
+// fileInfoMethod is SplFileInfo's methods on the fs.FileInfo values Go APIs return (like
+// getResources()).
+func fileInfoMethod(fi fs.FileInfo, method string) (any, bool) {
+	switch strings.ToLower(method) {
+	case "getfilename", "getbasename", "getpathname", "getrealpath", "__tostring":
+		return fi.Name(), true
+	case "getextension":
+		name := fi.Name()
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			return name[i+1:], true
+		}
+		return "", true
+	case "getsize":
+		return int(fi.Size()), true
+	case "isdir":
+		return fi.IsDir(), true
+	case "isfile":
+		return fi.Mode().IsRegular(), true
+	case "getmtime", "getctime", "getatime":
+		return int(fi.ModTime().Unix()), true
+	case "isreadable":
+		return true, true
+	}
+	return nil, false
+}
+
+// ClosureFromCallable is Closure::fromCallable(): any PHP callable as a function.
+func ClosureFromCallable(fn any) func(args ...any) any {
+	return func(args ...any) any { return Invoke(fn, args...) }
+}
+
+// methodShims are PocketMine-MP methods that pocketmine-go has as constants or unexported
+// methods, by Go type and lower-case PHP name.
+var methodShims = map[string]func(obj any, args ...any) any{}
+
+func init() {
+	methodShims["*world.World::getminy"] = func(any, ...any) any { return -64 }
+	methodShims["*world.World::getmaxy"] = func(any, ...any) any { return 320 }
+	methodShims["*world.World::getpotentialblockskylightat"] = func(w any, args ...any) any {
+		return WorldPotentialBlockSkyLightAt(w, arg(args, 0), arg(args, 1), arg(args, 2))
+	}
+}
+
+// BlockXYZ is the block coordinates (floored) of a position (a Vector3, Position or Location).
+func BlockXYZ(pos any) (int, int, int) {
+	rv := reflect.ValueOf(pos)
+	for rv.Kind() == reflect.Pointer && !rv.IsNil() {
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Struct {
+		return 0, 0, 0
+	}
+	get := func(n string) int {
+		if f := rv.FieldByName(n); f.IsValid() && f.CanFloat() {
+			return int(math.Floor(f.Float()))
+		}
+		return ToInt(Call(pos, "get"+n))
+	}
+	return get("X"), get("Y"), get("Z")
+}
+
+// Server returns the server the plugin runs in (set by the plugin's plugin.go).
+var Server func() any

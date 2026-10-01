@@ -5,8 +5,8 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
-	"regexp"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -178,6 +178,8 @@ var virionReplacements = []struct {
 	{`poggit\libasynql`, "libasynql.php", "libasynql"},
 	// SimplePacketHandler works on PocketMine-MP's packet classes.
 	{`muqsit\simplepackethandler`, "SimplePacketHandler.php", "simplepackethandler"},
+	// bStats sends plugin statistics from a PHP thread.
+	{`bStats\PocketmineMp`, "Metrics.php", "bstats"},
 }
 
 // replaceVirions swaps bundled libraries for phar2go's versions (see virionReplacements). It
@@ -196,13 +198,28 @@ func replaceVirions(files map[string][]byte) (map[string][]byte, bool) {
 			}
 		}
 		if dir == "" {
-			continue
+			// Not bundled, but used: add the replacement under its usual namespace.
+			used := false
+			for _, src := range files {
+				if strings.Contains(string(src), v.namespace+`\`) {
+					used = true
+					break
+				}
+			}
+			if !used {
+				continue
+			}
+			dir, ns = "phar2go-virions/"+v.dir+"/", v.namespace
 		}
 		out := make(map[string][]byte, len(files))
 		for p, src := range files {
-			if !strings.HasPrefix(p, dir) {
-				out[p] = src
+			// The library's own files: those in its namespace (its folder may hold others too).
+			if strings.HasPrefix(p, dir) && strings.HasSuffix(p, ".php") {
+				if m := reNS.FindSubmatch(src); m != nil && (strings.EqualFold(string(m[1]), ns) || strings.HasPrefix(strings.ToLower(string(m[1])), strings.ToLower(ns)+`\`)) {
+					continue
+				}
 			}
+			out[p] = src
 		}
 		root := "virions/" + v.dir
 		fs.WalkDir(virionStubs, root, func(p string, d fs.DirEntry, err error) error {
@@ -221,31 +238,48 @@ func replaceVirions(files map[string][]byte) (map[string][]byte, bool) {
 	return files, usesSQL
 }
 
-// addStubs adds PHP versions of PocketMine-MP traits that pocketmine-go has no Go type for,
-// when the plugin uses them.
+// addStubs adds phar2go's PHP versions of classes the plugin uses but doesn't contain:
+// PocketMine-MP traits pocketmine-go has no Go type for, and PHP's SPL classes.
 func (cv *converter) addStubs() {
+	defined := map[string]bool{}
 	var src strings.Builder
+	reDecl := regexp.MustCompile(`(?m)^\s*(?:abstract\s+|final\s+)*(?:class|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)`)
 	for _, f := range cv.files {
 		src.Write(f.Src)
+		for _, m := range reDecl.FindAllSubmatch(f.Src, -1) {
+			defined[strings.ToLower(string(m[1]))] = true
+		}
 	}
 	all := src.String()
 	entries, _ := stubs.ReadDir("stubs")
-	for _, e := range entries {
-		data, _ := stubs.ReadFile("stubs/" + e.Name())
-		used := false
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "trait ") {
-				name := strings.TrimSuffix(strings.Fields(line)[1], "{")
-				if strings.Contains(all, name) {
+	added := map[string]bool{}
+	// Stubs can use other stubs (ThreadSafeArray uses ArrayIterator): repeat until none is added.
+	for changed := true; changed; {
+		changed = false
+		for _, e := range entries {
+			if e.IsDir() || added[e.Name()] {
+				continue
+			}
+			data, _ := stubs.ReadFile("stubs/" + e.Name())
+			used := false
+			for _, m := range reDecl.FindAllSubmatch(data, -1) {
+				name := string(m[1])
+				if !defined[strings.ToLower(name)] && regexp.MustCompile(`\b`+name+`\b`).MatchString(all) {
 					used = true
 				}
 			}
-		}
-		if !used {
-			continue
-		}
-		if f, err := parsePHP("phar2go-stubs/"+e.Name(), data); err == nil {
-			cv.files = append(cv.files, f)
+			if !used {
+				continue
+			}
+			added[e.Name()] = true
+			if f, err := parsePHP("phar2go-stubs/"+e.Name(), data); err == nil {
+				cv.files = append(cv.files, f)
+				all += string(data)
+				for _, m := range reDecl.FindAllSubmatch(data, -1) {
+					defined[strings.ToLower(string(m[1]))] = true
+				}
+				changed = true
+			}
 		}
 	}
 }
@@ -359,6 +393,13 @@ func (cv *converter) prepare() {
 			c.ExtEmbed = api.Named(pkg.Path + "." + base)
 		} else {
 			cv.warnf(c.File.Path, "%s extends %s: no base type to embed was found", c.FQCN, c.ExtParentPH)
+		}
+	}
+	// A class extending a server class without a constructor of its own takes the server
+	// constructor's arguments (new class($id, $name) extends SpawnEgg{...}).
+	for _, c := range cv.classList {
+		if c.Kind == kindClass && c.ExtEmbed != nil && c.constructor() == nil {
+			cv.addImplicitCtor(c)
 		}
 	}
 	// Static and instance member names, signatures.
@@ -1103,4 +1144,49 @@ func containsYield(body []ast.Vertex) bool {
 		return !found
 	})
 	return found
+}
+
+// addImplicitCtor gives c a constructor that passes its arguments to its server parent's.
+func (cv *converter) addImplicitCtor(c *class) {
+	pkg := cv.idx.Packages[c.ExtEmbed.PkgPath()]
+	if pkg == nil {
+		return
+	}
+	n := cv.selfCtorParams(c.ExtEmbed)
+	if n < 0 {
+		for _, name := range cv.extCtorCands(c.ExtParentPH, c.ExtEmbed) {
+			fn, ok := pkg.Funcs[name]
+			if !ok || len(fn.Results) == 0 || fn.TypeParams > 0 {
+				continue
+			}
+			if !fn.Variadic {
+				n = len(fn.Params)
+			}
+			break
+		}
+	}
+	if n <= 0 {
+		return
+	}
+	{
+		var params, args []string
+		for i := 0; i < n; i++ {
+			params = append(params, fmt.Sprintf("$phar2goArg%d = null", i))
+			args = append(args, fmt.Sprintf("$phar2goArg%d", i))
+		}
+		src := fmt.Sprintf("<?php\nclass Phar2goImplicit{\n\tpublic function __construct(%s){\n\t\tparent::__construct(%s);\n\t}\n}\n",
+			strings.Join(params, ", "), strings.Join(args, ", "))
+		f, err := parsePHP(c.File.Path, []byte(src))
+		if err != nil {
+			return
+		}
+		walk(f.Root, func(n ast.Vertex) bool {
+			if m, ok := n.(*ast.StmtClassMethod); ok {
+				cv.addMember(c, f, m)
+				return false
+			}
+			return true
+		})
+		return
+	}
 }

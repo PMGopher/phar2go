@@ -196,6 +196,24 @@ func (f *fctx) coerce(v value, to *api.Type) string {
 	if from.IsVoid() {
 		return v.code
 	}
+	// A class name for a reflect.Type (EntityFactory::register(Zombie::class, ...)).
+	if to.K == api.KNamed && to.Name == "reflect.Type" && (from.IsString() || from.IsAny()) {
+		return f.phpx("ReflectType") + "(" + v.code + ")"
+	}
+	// A struct embedding the wanted one (entity.Location for a math.Vector3).
+	if from.K == api.KNamed && to.K == api.KNamed && !api.Identical(from, to) {
+		if ti := f.cv.typeInfo(from); ti != nil {
+			if ft, ok := ti.Fields[to.ObjName()]; ok && api.Identical(ft, to) {
+				return paren(v, 7) + "." + to.ObjName()
+			}
+		}
+	}
+	// A func literal for a named func type (entity.EntityCreationFunc).
+	if from.K == api.KFunc && to.K == api.KNamed {
+		if u := f.underlying(to); u.K == api.KFunc && api.Identical(from, u) {
+			return v.code
+		}
+	}
 	if v.konst {
 		u := f.underlying(to)
 		switch {

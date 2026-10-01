@@ -148,7 +148,7 @@ func (f *fctx) funcCall(x *ast.ExprFunctionCall, want *api.Type) value {
 			}
 		}
 		return callv(f.phpx("Map")+"("+strings.Join(kv, ", ")+")", arrayT(nil, nil))
-	case "extract", "get_defined_vars", "debug_backtrace", "debug_print_backtrace", "eval", "create_function", "set_error_handler", "set_exception_handler", "register_shutdown_function", "spl_autoload_register":
+	case "extract", "get_defined_vars", "debug_print_backtrace", "eval", "create_function", "set_error_handler", "set_exception_handler", "register_shutdown_function", "spl_autoload_register":
 		return callv(f.todo(x, "%s() isn't supported", name)+f.phpx("Unsupported")+"("+quote(name)+f.anyArgs(x.Args)+")", api.Any)
 	case "max", "min":
 		// Typed fast path for numbers.

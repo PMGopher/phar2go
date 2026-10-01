@@ -6,8 +6,10 @@ import (
 	"math"
 	"math/big"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -444,3 +446,100 @@ func Bcdiv(a, b any, scale ...int) string {
 	return bcString(new(big.Float).SetPrec(256).Quo(bcNum(a), d), bcScale(scale))
 }
 func Bccomp(a, b any, _ ...int) int { return bcNum(a).Cmp(bcNum(b)) }
+
+// Type IDs for the plugin's own items and blocks (ItemTypeIds::newId(), BlockTypeIds::newId()).
+// They start after the ones PocketMine-go gives to its own new items and blocks.
+var (
+	nextItemTypeID  = 30000
+	nextBlockTypeID = 15000
+	typeIDMu        sync.Mutex
+)
+
+// ItemTypeIdsNewId is ItemTypeIds::newId().
+func ItemTypeIdsNewId() int {
+	typeIDMu.Lock()
+	defer typeIDMu.Unlock()
+	nextItemTypeID++
+	return nextItemTypeID
+}
+
+// BlockTypeIdsNewId is BlockTypeIds::newId().
+func BlockTypeIdsNewId() int {
+	typeIDMu.Lock()
+	defer typeIDMu.Unlock()
+	nextBlockTypeID++
+	return nextBlockTypeID
+}
+
+// WorldChunkHash is World::chunkHash(): a unique int for chunk coordinates.
+func WorldChunkHash(x, z any) int {
+	return int(int64(ToInt(x))<<32 | int64(uint32(ToInt(z))))
+}
+
+// WorldGetXZ is World::getXZ(): the chunk coordinates of a WorldChunkHash.
+func WorldGetXZ(hash any) [2]int {
+	h := int64(ToInt(hash))
+	return [2]int{int(h >> 32), int(int32(uint32(h)))}
+}
+
+// WorldBlockHash is World::blockHash(): a unique int for block coordinates.
+func WorldBlockHash(x, y, z any) int {
+	const mask26 = 1<<26 - 1
+	return int(int64(ToInt(x)&mask26)<<38 | int64(ToInt(z)&mask26)<<12 | int64((ToInt(y)+2048)&0xfff))
+}
+
+// WorldGetBlockXYZ is World::getBlockXYZ(): the block coordinates of a WorldBlockHash.
+func WorldGetBlockXYZ(hash any) [3]int {
+	h := int64(ToInt(hash))
+	x := h >> 38
+	z := h << 26 >> 38
+	y := h&0xfff - 2048
+	return [3]int{int(x), int(y), int(z)}
+}
+
+// debug_backtrace() options.
+const (
+	DEBUG_BACKTRACE_PROVIDE_OBJECT = 1
+	DEBUG_BACKTRACE_IGNORE_ARGS    = 2
+)
+
+// DebugBacktrace is debug_backtrace(): Go has no PHP call frames, so it is the frames of the
+// converted functions, with their Go names and no class.
+func DebugBacktrace(_ ...any) *Array {
+	out := NewArray()
+	pcs := make([]uintptr, 32)
+	n := runtime.Callers(2, pcs)
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		fr, more := frames.Next()
+		name := fr.Function
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			name = name[i+1:]
+		}
+		out.Append(Map("function", name, "line", fr.Line, "file", fr.File))
+		if !more {
+			break
+		}
+	}
+	return out
+}
+
+// WorldPotentialBlockSkyLightAt is World::getPotentialBlockSkyLightAt(), which pocketmine-go
+// doesn't export: the sky light of a block without the time of day's reduction.
+func WorldPotentialBlockSkyLightAt(world any, x, y, z any) int {
+	if !ToBool(Call(world, "isInWorld", x, y, z)) {
+		if ToInt(y) >= 0 {
+			return 15
+		}
+		return 0
+	}
+	return ToInt(Call(world, "getRealBlockSkyLightAt", x, y, z)) + ToInt(Call(world, "getSkyLightReduction"))
+}
+
+// Binary::sign*() and unsign*() (pmmp/BinaryUtils).
+func BinarySignByte(v any) int    { return int(int8(ToInt(v))) }
+func BinaryUnsignByte(v any) int  { return int(uint8(ToInt(v))) }
+func BinarySignShort(v any) int   { return int(int16(ToInt(v))) }
+func BinaryUnsignShort(v any) int { return int(uint16(ToInt(v))) }
+func BinarySignInt(v any) int     { return int(int32(ToInt(v))) }
+func BinaryUnsignInt(v any) int   { return int(uint32(ToInt(v))) }

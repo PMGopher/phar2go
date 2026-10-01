@@ -28,6 +28,9 @@ type Index struct {
 	// PHPConsts are constants of PocketMine-MP classes ("lower-case class::NAME") with literal
 	// values, used when pocketmine-go has no Go constant for them.
 	PHPConsts map[string]PHPConst `json:"php_consts,omitempty"`
+	// PHPDefaults are the default values of the parameters of PocketMine-MP's methods
+	// ("lower-case class::method"), nil for a parameter without a literal default.
+	PHPDefaults map[string][]*PHPConst `json:"php_defaults,omitempty"`
 }
 
 // Package is one Go package of the server.
