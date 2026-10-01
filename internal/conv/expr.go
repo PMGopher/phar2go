@@ -856,6 +856,9 @@ func (f *fctx) classConst(x *ast.ExprClassConstFetch) value {
 	c, php, kind := f.staticClass(x.Class)
 	if strings.EqualFold(name, "class") {
 		switch {
+		case strings.EqualFold(identValue(x.Class), "static") && c != nil && c.Poly && !f.static && f.selfVar != "":
+			// Late static binding: the class of the object.
+			return callv(f.phpx("ClassName")+"("+f.selfVar+")", api.String)
 		case kind == "dynamic":
 			v := f.expr(x.Class, nil)
 			return callv(f.phpx("ClassName")+"("+v.code+")", api.String)
@@ -1343,9 +1346,13 @@ func (f *fctx) match(x *ast.ExprMatch, want *api.Type) value {
 	}
 	tmp := f.newTmp("m")
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "func() %s {\n%s := %s\n_ = %s\nswitch {\n", f.typeStr(t), tmp, subj.code, tmp)
-	hasDefault := false
 	subjIsTrue := subj.code == "true"
+	if subjIsTrue {
+		fmt.Fprintf(&sb, "func() %s {\nswitch {\n", f.typeStr(t))
+	} else {
+		fmt.Fprintf(&sb, "func() %s {\n%s := %s\nswitch {\n", f.typeStr(t), tmp, subj.code)
+	}
+	hasDefault := false
 	for _, a := range x.Arms {
 		arm := a.(*ast.MatchArm)
 		var conds []string
@@ -1378,7 +1385,8 @@ func (f *fctx) match(x *ast.ExprMatch, want *api.Type) value {
 	sb.WriteString("}\n")
 	if !hasDefault {
 		sb.WriteString(f.phpx("Throw") + "(" + f.phpx("NewError") + `("UnhandledMatchError", "Unhandled match case"))` + "\n")
+		sb.WriteString("return " + f.zero(t) + "\n")
 	}
-	sb.WriteString("return " + f.zero(t) + "\n}()")
+	sb.WriteString("}()")
 	return callv(sb.String(), t)
 }

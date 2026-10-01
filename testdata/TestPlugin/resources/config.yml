@@ -1,0 +1,3 @@
+greeting: "Hello {player}!"
+interval: 5
+worlds: [world, nether]

@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64, ext: .exe }
+          - { goos: windows, goarch: arm64, ext: .exe }
+          - { goos: linux, goarch: amd64, ext: "" }
+          - { goos: linux, goarch: arm64, ext: "" }
+          - { goos: darwin, goarch: amd64, ext: "" }
+          - { goos: darwin, goarch: arm64, ext: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          NAME="phar2go-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p dist/$NAME
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o dist/$NAME/phar2go${{ matrix.ext }} .
+          cp README.md LICENSE dist/$NAME/ 2>/dev/null || cp README.md dist/$NAME/
+          cd dist
+          if [ "${{ matrix.goos }}" = "windows" ]; then zip -qr $NAME.zip $NAME; else tar czf $NAME.tar.gz $NAME; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.*z*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt
+      - name: Replace an existing release of the same tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            gh release delete "$TAG" --repo "${{ github.repository }}" --cleanup-tag --yes || true
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: phar2go ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: dist/*

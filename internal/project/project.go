@@ -247,8 +247,9 @@ func findPluginYML(a *phar.Archive) (string, []byte, error) {
 // wantPHP filters out tests, tools and libraries that aren't part of the plugin at run time.
 func wantPHP(rel string) bool {
 	parts := strings.Split(rel, "/")
-	for _, p := range parts[:len(parts)-1] {
-		switch strings.ToLower(p) {
+	// Top-level folders that aren't part of the plugin at run time.
+	if len(parts) > 1 {
+		switch strings.ToLower(parts[0]) {
 		case "tests", "test", ".github", "stubs", "phpstan", "tools", "build", ".phar", "docs", "examples":
 			return false
 		}
